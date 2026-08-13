@@ -27,6 +27,11 @@ UTIL = ROOT / "scripts" / "journal_util.py"
 FAILURES: list[str] = []
 PASSES = 0
 
+# Default HOME for any subprocess that does not ask for a specific one. Set in
+# main(); a module-level placeholder keeps import-time use from silently
+# pointing at the real home.
+SCRATCH_HOME = Path(tempfile.gettempdir()) / "obsidian-dev-journal-tests-unset"
+
 
 def check(cond: bool, label: str) -> None:
     global PASSES
@@ -45,20 +50,42 @@ def load_capture():
     return mod
 
 
-def run_capture(*args: str, home: Path | None = None) -> subprocess.CompletedProcess:
+def sandbox_env(home: Path | None) -> dict:
+    """Never let a test reach the developer's real vault.
+
+    This is not hypothetical: a `run_capture(...)` call without `home=` inherited
+    the real HOME, read the real config, and wrote
+    `_raw/2026-08-13--obsidian-dev-journal--garbage.md` (session_id "garbage",
+    a hostile-input fixture) into the actual Obsidian vault, where it was then
+    synthesised into a note. HOME alone was not enough either, because
+    OBSIDIAN_VAULT and OBSIDIAN_DEV_JOURNAL_CONFIG override it.
+
+    With no explicit home, everything is pointed at a throwaway directory that
+    is asserted-clean by test_no_real_vault_writes().
+    """
+    home = home or SCRATCH_HOME
     env = dict(os.environ)
-    if home:
-        env["HOME"] = str(home)
+    env["HOME"] = str(home)
+    env["OBSIDIAN_DEV_JOURNAL_CONFIG"] = str(home / ".claude" / "obsidian-dev-journal" / "config.json")
+    env.pop("OBSIDIAN_VAULT", None)
+    return env
+
+
+def run_capture(*args: str, home: Path | None = None) -> subprocess.CompletedProcess:
     return subprocess.run(
-        [sys.executable, str(CAPTURE), *args], capture_output=True, text=True, env=env
+        [sys.executable, str(CAPTURE), *args],
+        capture_output=True,
+        text=True,
+        env=sandbox_env(home),
     )
 
 
 def run_util(*args: str, home: Path) -> subprocess.CompletedProcess:
-    env = dict(os.environ)
-    env["HOME"] = str(home)
     return subprocess.run(
-        [sys.executable, str(UTIL), *args], capture_output=True, text=True, env=env
+        [sys.executable, str(UTIL), *args],
+        capture_output=True,
+        text=True,
+        env=sandbox_env(home),
     )
 
 
@@ -94,12 +121,21 @@ def test_redaction(m) -> None:
         ("token: ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123", "ghp_"),
         ("Bearer sk-abcdefghijklmnop1234", "sk-abc"),
         ("OAUTH_TOKEN=xyz789 ./run.sh", "xyz789"),
+        ("credentials: hunter2", "hunter2"),                        # plural keyword
         # False positives: these must pass through untouched.
         ("git log --author=handawoon --oneline", None),
         ('git commit --author="Han <h@x.io>"', None),
         ("sort -u file.txt", None),
         ("curl -u admin http://x", None),
         ("just normal text with no secrets", None),
+        # Observed in the real vault: masking that destroyed content instead of
+        # secrets. A keyword that is only the prefix of a longer lowercase word
+        # is a different word.
+        ("master-2에서 ssh-keygen -R 10.0.0.5 실행", None),          # "-keygen" is not a flag
+        ('{"authorizedStoreSnapshot":"abc123"}', None),
+        ("authentication: JWT 로 바꿨다", None),
+        ("the secretary: bob", None),
+        ("tokenizer: sentencepiece", None),
     ]
     for text, leak in cases:
         got = m.redact(text)
@@ -270,6 +306,246 @@ def test_thresholds(tmp: Path) -> None:
     check("below signal threshold" in r.stdout, "one-prompt session skipped")
 
 
+def test_prompt_channels(m, tmp: Path) -> None:
+    """Queued input is recorded twice and harness text lands in the user channel.
+
+    Backfilling 130 digests showed only 51% of captured prompts were real user
+    turns: 26% were the transcript's double-write of `queue-operation` entries,
+    21% were injected <task-notification> blocks, and `system` recaps were being
+    quoted back as if the user had said them. That crowded genuine prompts out
+    of the max_prompts budget and let 1-turn sessions clear min_user_prompts.
+    """
+    print("\n[prompt channels]")
+
+    # -- dedupe_prompts() unit rules -------------------------------------- #
+    check(
+        m.dedupe_prompts([("shadow", "a"), ("user", "a")]) == ["a"],
+        "shadow dropped when the same text arrives as a real user prompt",
+    )
+    check(
+        m.dedupe_prompts([("user", "a"), ("shadow", "a")]) == ["a"],
+        "shadow dropped regardless of which side lands first",
+    )
+    check(
+        m.dedupe_prompts([("shadow", "q"), ("shadow", "q")]) == ["q"],
+        "queued-then-delivered shadow pair collapses to one",
+    )
+    check(
+        m.dedupe_prompts([("shadow", "A"), ("shadow", "B"), ("shadow", "A"), ("shadow", "B")])
+        == ["A", "B"],
+        "interleaved shadow pairs collapse (not just adjacent ones)",
+    )
+    # 94 real prompts in the local corpus existed *only* as queue-operation.
+    check(
+        m.dedupe_prompts([("shadow", "queued only")]) == ["queued only"],
+        "queue-only input is kept — dropping the channel would lose real prompts",
+    )
+    # Genuine repetition is two turns, not a duplicate.
+    check(
+        m.dedupe_prompts([("user", "다시"), ("user", "다시")]) == ["다시", "다시"],
+        "repeated user prompts are never deduped",
+    )
+    check(
+        m.dedupe_prompts([("user", "1"), ("shadow", "2"), ("user", "3")]) == ["1", "2", "3"],
+        "chronological order preserved across channels",
+    )
+
+    # -- end-to-end through the parser ------------------------------------ #
+    base = dict(cwd="/repo/ch", sessionId="ch1", isSidechain=False)
+    rows = [
+        {"type": "user", "message": {"role": "user", "content": "진짜 프롬프트"}, "timestamp": ts(9)},
+        # queued while busy: written once on queue, once on delivery
+        {"type": "queue-operation", "message": {"role": "user", "content": "큐에 넣은 말"}, "timestamp": ts(8)},
+        {"type": "queue-operation", "message": {"role": "user", "content": "큐에 넣은 말"}, "timestamp": ts(8)},
+        # shadow of a prompt that also lands as a real user entry
+        {"type": "queue-operation", "message": {"role": "user", "content": "그림자"}, "timestamp": ts(7)},
+        {"type": "user", "message": {"role": "user", "content": "그림자"}, "timestamp": ts(7)},
+        # harness-injected noise
+        {"type": "user", "message": {"role": "user", "content": "<task-notification>\n<task-id>x</task-id>"}, "timestamp": ts(6)},
+        {"type": "queue-operation", "message": {"role": "user", "content": "<task-notification>\n<task-id>y</task-id>"}, "timestamp": ts(6)},
+        {"type": "user", "message": {"role": "user", "content": "You have 3 orchestration messages. Run `orca orchestration check`."}, "timestamp": ts(5)},
+        # harness recap must not be quoted back as a user prompt
+        {"type": "system", "message": {"role": "user", "content": "Goal was X. Next: Y. (disable recaps in /config)"}, "timestamp": ts(4)},
+        {
+            "type": "assistant",
+            "message": {"role": "assistant", "model": "m", "content": [
+                {"type": "tool_use", "id": "t", "name": "Edit", "input": {"file_path": "/repo/ch/a.py"}}]},
+            "timestamp": ts(3),
+        },
+    ]
+    f = jsonl(tmp / "channels.jsonl", rows, base)
+    out = run_capture("--transcript", str(f), "--cwd", "/repo/ch", "--session-id", "ch1", "--stdout").stdout
+    body = out.split("## What I asked for", 1)[1].split("\n## ", 1)[0]
+
+    check("진짜 프롬프트" in body, "real user prompt kept")
+    check(body.count("큐에 넣은 말") == 1, "double-written queued prompt appears once")
+    check(body.count("그림자") == 1, "shadow of a delivered prompt appears once")
+    check("task-notification" not in body, "<task-notification> filtered from prompts")
+    check("orchestration check" not in body, "orchestration nudge filtered from prompts")
+    check("Goal was X" not in body, "system recap not quoted as a user prompt")
+
+    # Recaps are the densest line in most sessions — the backfill leaned on them
+    # for "무엇을 했나" / "남은 일". Filtering them out of prompts must not throw
+    # them away; they move to their own, correctly attributed section.
+    check("## Session recaps" in out, "recap section emitted")
+    check("Goal was X. Next: Y." in out, "recap text preserved under its own heading")
+    check(
+        out.index("## What I asked for") < out.index("## Session recaps"),
+        "recaps rendered after prompts, before the tail sections that truncation eats",
+    )
+
+    # A commit-message-generation call is one prompt recorded on both channels;
+    # before the fix it counted as 2 and cleared min_user_prompts, producing 6
+    # content-free digests in the local corpus.
+    hook = "You are generating a single git commit message."
+    f2 = jsonl(
+        tmp / "commitmsg.jsonl",
+        [
+            {"type": "queue-operation", "message": {"role": "user", "content": hook}, "timestamp": ts(4)},
+            {"type": "user", "message": {"role": "user", "content": hook}, "timestamp": ts(4)},
+        ],
+        dict(cwd="/repo/cm", sessionId="cm1", isSidechain=False),
+    )
+    r = run_capture("--transcript", str(f2), "--cwd", "/repo/cm", "--session-id", "cm1")
+    check("below signal threshold" in r.stdout, "shadow no longer inflates a 1-prompt session past the threshold")
+
+
+def test_size_budget(m, tmp: Path) -> None:
+    """The size cap must spend the budget on facts, not on verbose prompts.
+
+    The old build_digest rendered every section then hard-cut the tail. Over 130
+    backfilled digests, 20 hit the cap and lost exactly the densest sections:
+    commits 20/20, errors 17/20, commands 8/20 — while 40 prompts at 600 chars
+    each survived. Anything in this test that regresses means the synthesiser
+    stops seeing what actually changed in a big session.
+    """
+    print("\n[size budget]")
+
+    # -- fit_sections() unit rules ---------------------------------------- #
+    def sec(name, items, title=None):
+        return m._section(name, title or f"## {name}", list(items), "…{n} more")
+
+    protected = sec("errors", [f"- err {i}" for i in range(10)])
+    hog = sec("prompts", [f"{i}. " + "x" * 200 for i in range(40)])
+    out = m.fit_sections(["head"], [hog, protected], 3000)
+    text = "\n".join(out)
+    check(len(text) <= 3000, "fitter respects the budget")
+    check(all(f"- err {i}" in text for i in range(10)), "errors never trimmed to make room")
+    check("## prompts" in text and "more" in text, "trimmed section keeps its heading + marker")
+
+    # Floors stop a section from vanishing entirely.
+    only_hog = sec("prompts", [f"{i}. " + "y" * 400 for i in range(40)])
+    m.fit_sections(["head"], [only_hog], 500)
+    check(len(only_hog["items"]) == 8, "prompts stop shrinking at their floor (8)")
+
+    # keep_edges: first and last prompts survive, the middle goes.
+    edged = sec("prompts", [f"P{i} " + "z" * 300 for i in range(20)])
+    m.fit_sections(["head"], [edged], 1500)
+    kept = edged["items"]
+    check(kept[0].startswith("P0"), "first prompt kept (says what the session was for)")
+    check(kept[-1].startswith("P19"), "last prompt kept (says how it ended)")
+    check(len(kept) < 20 and edged["dropped"] > 0, "middle prompts dropped and counted")
+
+    # Cheap sections give way before expensive ones. Sized so that emptying
+    # research alone (~600 chars) closes the gap without touching prompts.
+    research = sec("research", ["- https://example.com/" + "u" * 40 for _ in range(10)])
+    prompts = sec("prompts", [f"{i}. " + "w" * 100 for i in range(12)])
+    m.fit_sections(["head"], [prompts, research], 1500)
+    check(
+        research["dropped"] > 0 and prompts["dropped"] == 0,
+        "research trimmed before prompts (TRIM_PLAN order honoured)",
+    )
+    # Trim only as much as the budget demands — not the whole section.
+    partial = sec("research", ["- " + "u" * 80 for _ in range(10)])
+    m.fit_sections(["head"], [partial], 200)
+    check(
+        0 < len(partial["items"]) < 10,
+        "fitter stops at the first fit instead of emptying the section",
+    )
+    # Under a brutal budget it does empty — and must still leave a trace, so
+    # "10 lookups, none shown" is distinguishable from "no lookups".
+    gone = sec("research", ["- " + "u" * 80 for _ in range(10)])
+    text_gone = "\n".join(m.fit_sections(["head"], [gone], 50))
+    check(not gone["items"], "cheap section can be emptied when the budget demands it")
+    check("## research" in text_gone and "10 more" in text_gone,
+          "emptied section still reports what it dropped")
+
+    # The "…N more" marker a section gains on its first drop grows the digest.
+    # Tracking size as "freed = len(item)" ignored that, so the loop believed it
+    # had fit while the real text was still over budget — and the tail (commits)
+    # got blind-cut anyway. Pin the invariant: whatever fit_sections returns is
+    # within budget, marker included.
+    def wide_sections():
+        return [
+            sec("prompts", [f"{i}. " + "p" * 120 for i in range(20)]),
+            sec("commands", [f"- cmd {i} " + "c" * 60 for i in range(20)]),
+            sec("research", [f"- url {i} " + "r" * 50 for i in range(20)]),
+            sec("errors", [f"- err {i} " + "e" * 70 for i in range(20)]),
+        ]
+
+    for budget in (2500, 4000, 8000):
+        got = "\n".join(m.fit_sections(["head"], wide_sections(), budget))
+        check(len(got) <= budget, f"fitter output within budget after markers (budget={budget})")
+
+    # Below the sum of the floors the budget is unreachable by design; the
+    # fitter shrinks to the floors and build_digest's backstop does the rest.
+    floored = wide_sections()
+    m.fit_sections(["head"], floored, 100)
+    at_floor = {s["name"]: len(s["items"]) for s in floored}
+    check(
+        at_floor["prompts"] == 8 and at_floor["errors"] == 5 and at_floor["research"] == 0,
+        "impossible budget shrinks every section to its floor, no further",
+    )
+
+    # -- end-to-end: a session that used to lose its tail ------------------ #
+    base = dict(cwd="/repo/big2", sessionId="bg2", isSidechain=False)
+    rows = []
+    for i in range(40):
+        rows.append({"type": "user", "message": {"role": "user", "content": f"프롬프트 {i} " + "가" * 550}, "timestamp": ts(60 - i)})
+    rows.append({
+        "type": "assistant",
+        "message": {"role": "assistant", "model": "m", "content": [
+            {"type": "tool_use", "id": "q1", "name": "AskUserQuestion",
+             "input": {"questions": [{"question": "저장소?", "options": [{"label": "Redis"}]}]}}]},
+        "timestamp": ts(10),
+    })
+    rows.append({
+        "type": "user",
+        "message": {"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": "q1", "content": 'The user answered: "저장소?"="Redis"'}]},
+        "timestamp": ts(9),
+    })
+    rows.append({
+        "type": "assistant",
+        "message": {"role": "assistant", "model": "m", "content": [
+            {"type": "tool_use", "id": "b1", "name": "Bash", "input": {"command": "pytest -x tests/"}}]},
+        "timestamp": ts(8),
+    })
+    rows.append({
+        "type": "user",
+        "message": {"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": "b1", "content": "Error: boom", "is_error": True}]},
+        "timestamp": ts(7),
+    })
+    for i in range(30):
+        rows.append({
+            "type": "assistant",
+            "message": {"role": "assistant", "model": "m", "content": [
+                {"type": "tool_use", "id": f"e{i}", "name": "Edit", "input": {"file_path": f"/repo/big2/src/mod{i}.py"}}]},
+            "timestamp": ts(6),
+        })
+    f = jsonl(tmp / "budget.jsonl", rows, base)
+    out2 = run_capture("--transcript", str(f), "--cwd", "/repo/big2", "--session-id", "bg2", "--stdout").stdout
+
+    check(len(out2) <= 14000, "digest still respects max_digest_chars")
+    check("## Files touched" in out2 and "mod0.py" in out2, "files survive a prompt-heavy session")
+    check("## Errors" in out2 and "boom" in out2, "errors survive a prompt-heavy session")
+    check("**chose:** Redis" in out2, "AskUserQuestion survives a prompt-heavy session")
+    check("pytest -x" in out2, "commands survive a prompt-heavy session")
+    check("_[digest truncated]_" not in out2, "no blind tail cut — sections shrink instead")
+    check("프롬프트 0" in out2, "opening prompt survives")
+
+
 def test_worktree_and_git(tmp: Path) -> None:
     print("\n[worktree + git]")
     if not shutil.which("git"):
@@ -329,6 +605,346 @@ def test_worktree_and_git(tmp: Path) -> None:
     check("inside window" in out3, "in-window commit captured (git date parsing)")
     check("outside window" not in out3, "post-session commits excluded")
     check("Uncommitted" not in out3, "stale dirty state omitted for old sessions")
+
+
+def test_repo_attribution(m, tmp: Path) -> None:
+    """Which repo a session belongs to. Every case here was wrong in the vault."""
+    print("\n[repo attribution]")
+    if not shutil.which("git"):
+        print("  SKIP  git not available")
+        return
+
+    root = tmp / "attr"
+    repo = root / "my-api"
+    (repo / "tests" / "unit").mkdir(parents=True)
+    subprocess.run(["git", "-C", str(repo), "init", "-q"], capture_output=True)
+
+    # `git -C <dir> rev-parse --git-common-dir` answers relative to <dir>. It
+    # used to be resolved against the worktree *root*, so from my-api/tests git
+    # said "../.git" and the plugin read ~/attr/.git — repo "attr", worktree
+    # "my-api", repo_name_guessed false. 11 of 133 real digests were filed that
+    # way, two of them with no warning at all.
+    for depth, where in ((1, repo / "tests"), (2, repo / "tests" / "unit")):
+        ident = m.repo_identity(str(where))
+        check(ident["repo"] == "my-api", f"subdirectory (depth {depth}) attributed to its repo")
+        check(ident["worktree"] == "", f"subdirectory (depth {depth}) is not a phantom worktree")
+        check(ident["guessed"] is False, f"subdirectory (depth {depth}) is not a guess")
+
+    # The repo root itself and a real linked worktree must be unaffected.
+    check(m.repo_identity(str(repo))["repo"] == "my-api", "repo root still resolves")
+    subprocess.run(
+        ["git", "-C", str(repo), "-c", "user.email=t@t.io", "-c", "user.name=t",
+         "commit", "-q", "--allow-empty", "-m", "init"], capture_output=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(repo), "worktree", "add", "-q", str(root / "feat-y"), "-b", "feat-y"],
+        capture_output=True,
+    )
+    wt = m.repo_identity(str(root / "feat-y"))
+    check(wt["repo"] == "my-api" and wt["worktree"] == "feat-y", "linked worktree unchanged by the fix")
+
+    # A deleted checkout walks up for a surviving repo, but only a few levels:
+    # an unbounded climb lands on ~ , and a dotfiles-managed home is a git repo,
+    # so every removed worktree would confidently claim the user's home.
+    deep = repo / "a" / "b" / "c" / "d" / "e" / "gone"
+    far = m.repo_identity(str(deep))
+    check(far["guessed"] is True, "a checkout too deep under a repo stays a guess")
+    check("no longer exists" in far["reason"], "and says the directory is gone")
+
+    # Which cwd *is* the session. It used to be the last one recorded, so a
+    # session that ended with one `cd tests/` was filed under whatever that
+    # resolved to — while journal_util read the first cwd and the note's date
+    # came from the first timestamp. 16 of 218 transcripts have first != last.
+    check(m.resolve_cwd({}) is None, "no cwd recorded -> None")
+    check(m.resolve_cwd({"/a": 40, "/b": 2}) == "/a", "the dominant cwd wins over a late cd")
+    check(m.resolve_cwd({"/a": 3, "/b": 3}) == "/a", "ties go to the earliest cwd")
+
+    # Without git to canonicalise, the leaf directory is a bad project name:
+    # `<project>/scripts` was filed as repo "scripts", `<project>/outputs` as
+    # "outputs". Back off to the shallowest directory the session actually
+    # visited — but only when the name is already a guess, and never to a
+    # directory the session never saw.
+    plain = tmp / "attr" / "not-a-repo"
+    (plain / "scripts").mkdir(parents=True)
+    seen = {str(plain): 3, str(plain / "scripts"): 9}
+    check(m.repo_identity(str(plain / "scripts"))["repo"] == "scripts", "leaf name alone is the guess")
+    check(m.refine_identity(str(plain / "scripts"), seen)["repo"] == "not-a-repo",
+          "a guessed name backs off to the project directory the session worked in")
+    check(m.refine_identity(str(plain / "scripts"), {})["repo"] == "scripts",
+          "with no other directory observed, the leaf name stands")
+    check(m.refine_identity(str(repo / "tests"), {str(root): 5})["repo"] == "my-api",
+          "a resolved repo is never demoted to an ancestor")
+
+    # The most-visited directory can be a plain folder that merely *contains*
+    # repos: a session sat in ~/Work/GPU-cluster (not a repo) while doing its
+    # work in .../ansible_boundless (a repo). The repo has to win.
+    holder = tmp / "attr" / "holder"
+    inner = holder / "real-repo"
+    inner.mkdir(parents=True)
+    subprocess.run(["git", "-C", str(inner), "init", "-q"], capture_output=True)
+    check(m.refine_identity(str(holder), {str(holder): 30, str(inner): 4})["repo"] == "real-repo",
+          "a guessed parent yields to a repo the session actually worked in")
+    check(m.refine_identity(str(holder), {str(holder): 30})["repo"] == "holder",
+          "but only to a directory the session really visited")
+
+    rows = [{"cwd": str(repo), "type": "user", "message": {"role": "user", "content": f"p{i}"},
+             "timestamp": ts(20 - i)} for i in range(6)]
+    rows.append({"cwd": str(repo / "tests"), "type": "user",
+                 "message": {"role": "user", "content": "마지막에 cd"}, "timestamp": ts(1)})
+    f = jsonl(tmp / "attr.jsonl", rows, {"sessionId": "at1", "isSidechain": False})
+    out = run_capture("--transcript", str(f), "--cwd", "/ignored", "--session-id", "at1", "--stdout").stdout
+    check(f'cwd: "{repo}"' in out, "session cwd is where it spent its entries, not where it ended")
+    check('repo: "my-api"' in out, "and the repo follows from it")
+
+
+def test_command_and_failure_capture(tmp: Path) -> None:
+    """Shell work that the digest used to throw away."""
+    print("\n[commands + failures]")
+    ok = {"content": "done", "type": "tool_result", "tool_use_id": "t%d"}
+
+    def bash(i: int, cmd: str, result: str, is_error: bool = False) -> list:
+        return [
+            {"type": "assistant", "message": {"role": "assistant", "content": [
+                {"type": "tool_use", "id": f"t{i}", "name": "Bash", "input": {"command": cmd}}]},
+             "timestamp": ts(30 - i)},
+            {"type": "user", "message": {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": f"t{i}", "content": result,
+                 **({"is_error": True} if is_error else {})}]},
+             "timestamp": ts(29 - i)},
+        ]
+
+    rows = [{"type": "user", "message": {"role": "user", "content": "배포 확인해줘"}, "timestamp": ts(40)},
+            {"type": "user", "message": {"role": "user", "content": "고쳐줘"}, "timestamp": ts(39)}]
+    # P4: ops verbs are work. 6027 of 8706 bash calls were dropped as "noise",
+    # led by ssh (1242) — and fleet work *is* ssh.
+    rows += bash(1, "ssh master-2 'systemctl status validator'", "active (running)")
+    rows += bash(2, "curl -s http://localhost:9090/-/healthy", "OK")
+    rows += bash(3, "python3 scripts/report.py", "wrote report")
+    rows += bash(4, "ls -la /tmp", "a b c")               # still noise
+    # P3: a failing command comes back as an ordinary result. 243 such failures
+    # were invisible while 22 digests with 50+ turns claimed errors_hit: 0.
+    rows += bash(5, "pytest tests/", "..F.. 5 failed, 263 passed in 12s")
+    rows += bash(6, "python3 -c 'import x'", "Traceback (most recent call last): ModuleNotFoundError: No module named 'x'")
+    rows += bash(7, "cat notes.txt", "everything is fine, 0 failed")   # must not fire
+    rows += bash(10, "dpm test", "exit=0 quiet ok: 277 failed: 0")     # count belongs to "ok:"
+    rows += bash(8, "make build", "boom", True)                        # real tool error
+
+    f = jsonl(tmp / "cmds.jsonl", rows, {"cwd": "/repo/ops", "sessionId": "cm2", "isSidechain": False})
+    out = run_capture("--transcript", str(f), "--cwd", "/repo/ops", "--session-id", "cm2", "--stdout").stdout
+
+    check("ssh master-2" in out, "ssh captured")
+    check("systemctl status" in out, "systemctl captured")
+    check("curl -s http" in out, "curl captured")
+    check("python3 scripts/report.py" in out, "python captured")
+    check("ls -la /tmp" not in out, "plain ls still filtered out")
+
+    check("5 failed, 263 passed" in out, "a failing test run is recorded as a failure")
+    check("ModuleNotFoundError" in out, "a traceback is recorded as a failure")
+    check("_(inferred from output)_" in out, "inferred failures are marked as such")
+    check("everything is fine" not in out, "'0 failed' does not count as a failure")
+    check("quiet ok: 277" not in out, "'ok: 277 failed: 0' is a summary, not a failure")
+    check("- **Bash**: boom" in out or "**Bash** on" in out, "flagged tool errors still captured")
+    check("errors_hit: 3" in out, "errors_hit counts real + inferred, not the false positive")
+
+    # An `extra_commands` regex covers domain tooling an allowlist cannot know.
+    cfg = tmp / "extra.json"
+    cfg.write_text(json.dumps({"extra_commands": r"\b(daml|vast)\b"}), encoding="utf-8")
+    rows2 = rows + bash(9, "daml build --all", "compiled")
+    f2 = jsonl(tmp / "cmds2.jsonl", rows2, {"cwd": "/repo/ops", "sessionId": "cm3", "isSidechain": False})
+    env = dict(os.environ, OBSIDIAN_DEV_JOURNAL_CONFIG=str(cfg), HOME=str(SCRATCH_HOME))
+    got = subprocess.run(
+        [sys.executable, str(CAPTURE), "--transcript", str(f2), "--cwd", "/repo/ops",
+         "--session-id", "cm3", "--stdout"], capture_output=True, text=True, env=env,
+    ).stdout
+    check("daml build --all" in got, "extra_commands widens the allowlist")
+
+    bad = tmp / "badre.json"
+    bad.write_text(json.dumps({"extra_commands": "("}), encoding="utf-8")
+    env["OBSIDIAN_DEV_JOURNAL_CONFIG"] = str(bad)
+    r = subprocess.run(
+        [sys.executable, str(CAPTURE), "--transcript", str(f2), "--cwd", "/repo/ops",
+         "--session-id", "cm4", "--stdout"], capture_output=True, text=True, env=env,
+    )
+    check(r.returncode == 0 and "ssh master-2" in r.stdout, "a broken extra_commands regex degrades, not crashes")
+
+
+def test_part_digest(tmp: Path) -> None:
+    """A session that keeps going after its digest was synthesised."""
+    print("\n[part digests]")
+    home = tmp / "parthome"
+    vault = tmp / "partvault"
+    (vault / ".obsidian").mkdir(parents=True)
+    (home / ".claude").mkdir(parents=True)
+    run_util("init", "--vault", str(vault), home=home)
+    raw = vault / "DevJournal" / "_raw"
+
+    def rows(n: int) -> list:
+        out = [{"type": "user", "message": {"role": "user", "content": f"p{i}"}, "timestamp": ts(60 - i)}
+               for i in range(3)]
+        for i in range(n):
+            out.append({"type": "assistant",
+                        "message": {"role": "assistant", "content": [{"type": "text", "text": f"turn {i}"}]},
+                        "timestamp": ts(50 - i)})
+        return out
+
+    base = {"cwd": "/repo/long", "sessionId": "pc1", "isSidechain": False}
+    f1 = jsonl(tmp / "pc-a.jsonl", rows(4), base)
+    run_capture("--transcript", str(f1), "--cwd", "/repo/long", "--session-id", "pc1", home=home)
+    first = sorted(raw.glob("*.md"))
+    check(len(first) == 1, "PreCompact digest written")
+
+    # Synthesised mid-session, then the session continues.
+    run_util("done", str(first[0]), home=home)
+    f2 = jsonl(tmp / "pc-b.jsonl", rows(9), base)
+    run_capture("--transcript", str(f2), "--cwd", "/repo/long", "--session-id", "pc1", home=home)
+
+    files = sorted(p.name for p in raw.glob("*.md"))
+    check(len(files) == 2, "the rest of the session is not silently dropped")
+    part = [p for p in raw.glob("*.md") if "--part2" in p.name]
+    check(len(part) == 1, "it lands in a part2 file")
+    if part:
+        head = part[0].read_text(encoding="utf-8")[:900]
+        check("part: 2" in head, "part is recorded in the frontmatter")
+        check("turns: 9" in head, "the part digest is the richer one")
+        check("Part 2 of this session" in head, "and warns the reader about the overlap")
+    check("status: processed" in first[0].read_text(encoding="utf-8")[:600],
+          "the already-synthesised digest is left untouched")
+
+    # Not richer -> still nothing new. The escape hatch must not fire on every
+    # duplicate capture of an already-processed session.
+    f3 = jsonl(tmp / "pc-c.jsonl", rows(2), base)
+    run_capture("--transcript", str(f3), "--cwd", "/repo/long", "--session-id", "pc1", home=home)
+    check(len(list(raw.glob("*.md"))) == 2, "a thinner re-capture of a processed session writes nothing")
+
+
+def test_session_identity_and_states(tmp: Path) -> None:
+    """One session must yield one digest, and a digest must be parkable.
+
+    Both gaps showed up in a 130-digest backfill: a session whose checkout was
+    renamed mid-flight (zot -> internal-registry) landed as two digests and got
+    synthesised twice, and a digest the user wanted deferred had nowhere to go —
+    it sat in `pending` forever, indistinguishable from a backlog.
+    """
+    print("\n[session identity + states]")
+    home = tmp / "home2"
+    (home / ".claude").mkdir(parents=True)
+    vault = home / "V2"
+    (vault / ".obsidian").mkdir(parents=True)
+    run_util("init", "--vault", str(vault), home=home)
+    raw = vault / "DevJournal" / "_raw"
+
+    # Same session, captured twice with the checkout renamed in between.
+    sid = "abcdef01-2222-3333-4444-5555deadbeef"
+    def rows(cwd, n):
+        out = [{"type": "user", "message": {"role": "user", "content": f"프롬프트 {i}"},
+                "cwd": cwd, "sessionId": sid, "timestamp": ts(20 - i)} for i in range(3)]
+        for i in range(n):
+            out.append({"type": "assistant", "cwd": cwd, "sessionId": sid,
+                        "message": {"role": "assistant", "model": "m", "content": [
+                            {"type": "tool_use", "id": f"t{i}", "name": "Edit",
+                             "input": {"file_path": f"{cwd}/f{i}.py"}}]},
+                        "timestamp": ts(5)})
+        return out
+
+    f1 = jsonl(tmp / "s_old.jsonl", rows("/work/zot", 2))
+    run_capture("--transcript", str(f1), "--cwd", "/work/zot", "--session-id", sid, home=home)
+    check(len(list(raw.glob("*.md"))) == 1, "first capture writes one digest")
+
+    f2 = jsonl(tmp / "s_new.jsonl", rows("/work/internal-registry", 9))
+    run_capture("--transcript", str(f2), "--cwd", "/work/internal-registry",
+                "--session-id", sid, home=home)
+    files = sorted(raw.glob("*.md"))
+    check(len(files) == 1, "renamed checkout does not create a second digest for one session")
+    check("internal-registry" in files[0].name, "the richer digest wins and keeps the new repo name")
+
+    # A thinner re-capture must not replace the richer one.
+    run_capture("--transcript", str(f1), "--cwd", "/work/zot", "--session-id", sid, home=home)
+    files = sorted(raw.glob("*.md"))
+    check(len(files) == 1 and "internal-registry" in files[0].name,
+          "thinner re-capture neither replaces nor duplicates")
+
+    # A different session that happens to share nothing must still land.
+    other = "99999999-0000-0000-0000-000000000000"
+    f3 = jsonl(tmp / "s_other.jsonl", rows("/work/zot", 2))
+    run_capture("--transcript", str(f3), "--cwd", "/work/zot", "--session-id", other, home=home)
+    check(len(list(raw.glob("*.md"))) == 2, "a genuinely different session still gets its own digest")
+
+    # -- hold / unhold ----------------------------------------------------- #
+    target = str(files[0])
+    r = run_util("hold", target, "--reason", "레포가 다른 머신에 있음", home=home)
+    check(json.loads(r.stdout)["held"] == [target], "hold parks a digest")
+    pend = json.loads(run_util("pending", home=home).stdout)
+    check(pend["held"] == 1, "pending reports parked digests separately")
+    check(all(target != d["path"] for d in pend["digests"]), "parked digest leaves the queue")
+    head = Path(target).read_text(encoding="utf-8")[:400]
+    check("hold_reason:" in head and "레포가 다른" in head, "hold records why")
+
+    r = run_util("done", target, home=home)
+    check(json.loads(r.stdout)["skipped"], "done refuses to silently process a parked digest")
+
+    r = run_util("unhold", target, home=home)
+    check(json.loads(r.stdout)["returned_to_queue"] == [target], "unhold returns it to the queue")
+    check(json.loads(run_util("pending", home=home).stdout)["held"] == 0, "no longer parked")
+
+    # -- done --note back-reference ---------------------------------------- #
+    note = str(vault / "DevJournal" / "Sessions" / "2026-08-13-wave.md")
+    r = run_util("done", target, "--note", note, home=home)
+    check(json.loads(r.stdout)["marked"] == [target], "done marks processed")
+    head = Path(target).read_text(encoding="utf-8")[:500]
+    check("notes: [" in head and "2026-08-13-wave.md" in head,
+          "done records which note the digest produced")
+    check(head.count("processed:") == 1, "re-stamping does not duplicate frontmatter keys")
+
+    # -- index note --------------------------------------------------------- #
+    idx = vault / "DevJournal" / "DevJournal.md"
+    check(idx.is_file(), "init creates the vault index note")
+    body = idx.read_text(encoding="utf-8")
+    check("DevJournal/Sessions" in body and 'status = "held"' in body,
+          "index queries the journal folder and surfaces parked digests")
+    before = idx.read_text(encoding="utf-8")
+    idx.write_text(before + "\n손으로 추가한 메모\n", encoding="utf-8")
+    run_util("index", home=home)
+    check("손으로 추가한 메모" in idx.read_text(encoding="utf-8"),
+          "index does not clobber user edits without --force")
+    run_util("index", "--force", home=home)
+    check("손으로 추가한 메모" not in idx.read_text(encoding="utf-8"), "--force rewrites it")
+
+    # -- batch suggestion ---------------------------------------------------- #
+    for i in range(40):
+        (raw / f"2026-01-{i % 28 + 1:02d}--r--x{i:04d}.md").write_text(
+            f'---\nstatus: unprocessed\nsession_id: "x{i}"\nrepo: "r"\nstarted: "2026-01-01"\n---\n',
+            encoding="utf-8",
+        )
+    pend = json.loads(run_util("pending", home=home).stdout)
+    check(pend["suggested_batch"] > 8, "batch suggestion scales with a large backlog")
+    check(pend["suggested_batch"] <= 16, "batch suggestion stays bounded")
+
+    # -- prune -------------------------------------------------------------- #
+    # `_raw` never emptied: 133 processed digests sat in the real vault, indexed
+    # by Obsidian forever. Only synthesised ones may go, and they go *out* of
+    # the vault so a vault search stops matching them.
+    old = raw / "2026-01-01--r--pruneme.md"
+    old.write_text('---\nstatus: processed\nprocessed: 2020-01-01\nsession_id: "old"\n---\nbody\n',
+                   encoding="utf-8")
+    fresh = raw / "2026-01-02--r--keepme.md"
+    fresh.write_text('---\nstatus: processed\nprocessed: 2099-01-01\nsession_id: "new"\n---\nbody\n',
+                     encoding="utf-8")
+    parked = raw / "2026-01-03--r--parked.md"
+    parked.write_text('---\nstatus: held\nsession_id: "held"\n---\nbody\n', encoding="utf-8")
+
+    queued_before = len(json.loads(run_util("pending", home=home).stdout)["digests"])
+    r = json.loads(run_util("prune", "--older-than", "30", "--dry-run", home=home).stdout)
+    check(r["candidates"] == ["2026-01-01--r--pruneme.md"], "dry-run picks only the aged, processed digest")
+    check(old.is_file(), "dry-run moves nothing")
+
+    r = json.loads(run_util("prune", "--older-than", "30", home=home).stdout)
+    check(not old.exists(), "prune removes the digest from the vault")
+    check(fresh.is_file(), "a recently synthesised digest stays")
+    check(parked.is_file(), "a parked digest is never pruned")
+    archived = home / ".claude" / "obsidian-dev-journal" / "archive" / old.name
+    check(archived.is_file(), "it is archived outside the vault, not destroyed")
+    check(len(json.loads(run_util("pending", home=home).stdout)["digests"]) == queued_before,
+          "pruning does not disturb the pending queue")
 
 
 def test_vault_workflow(tmp: Path) -> None:
@@ -409,6 +1025,65 @@ def test_vault_workflow(tmp: Path) -> None:
     check("_raw_by_status" in json.loads(run_util("stats", home=home).stdout), "stats works")
 
 
+def test_host_field(m, tmp: Path) -> None:
+    """Which machine a session ran on is capture-time-only information.
+
+    The field exists for the day two machines' vaults are merged into one:
+    digests are keyed by session_id and carry no other clue about their origin.
+    Nothing can reconstruct it afterwards, so it has to be right from the first
+    capture — and it must never *invent* a host, which is exactly what
+    slugify()'s "session" fallback does when handed an empty string.
+    """
+    print("\n[host field]")
+    check(m.host_name({"host_name": "work-mbp"}) == "work-mbp", "config host_name wins over the hostname")
+    check("." not in m.host_name({}), "auto host keeps the first label only (mbp.local flips to .lan on another network)")
+    check(m.host_name({"host_name": 'a"b c'}) == "a-b-c", "host is slugified, so it cannot break the YAML block")
+
+    real_gethostname = m.socket.gethostname
+    try:
+        m.socket.gethostname = lambda: ""
+        check(m.host_name({}) == "", "a machine with no hostname yields '', not slugify's 'session' fallback")
+        m.socket.gethostname = lambda: (_ for _ in ()).throw(OSError("no hostname"))
+        check(m.host_name({}) == "", "a failing gethostname degrades to '' instead of killing the digest")
+    finally:
+        m.socket.gethostname = real_gethostname
+
+    # End to end: two machines' digests land side by side, as they would after
+    # someone merges the `_raw` folders of two vaults.
+    home = tmp / "home_host"
+    (home / ".claude").mkdir(parents=True)
+    vault = home / "VH"
+    (vault / ".obsidian").mkdir(parents=True)
+    run_util("init", "--vault", str(vault), home=home)
+    cfg_path = home / ".claude" / "obsidian-dev-journal" / "config.json"
+    raw = vault / "DevJournal" / "_raw"
+
+    def capture_on(host: str, sid: str) -> Path:
+        cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
+        cfg["host_name"] = host
+        cfg_path.write_text(json.dumps(cfg), encoding="utf-8")
+        rows = [{"type": "user", "message": {"role": "user", "content": f"프롬프트 {i}"},
+                 "cwd": "/repo/h", "sessionId": sid, "timestamp": ts(10 - i)} for i in range(3)]
+        f = jsonl(tmp / f"host_{sid}.jsonl", rows)
+        run_capture("--transcript", str(f), "--cwd", "/repo/h", "--session-id", sid, home=home)
+        return next(p for p in raw.glob(f"*{sid}.md"))
+
+    a = capture_on("work-mbp", "hosta111")
+    check('host: "work-mbp"' in a.read_text()[:600], "host lands in the frontmatter block")
+    b = capture_on("home-desktop", "hostb222")
+
+    st = json.loads(run_util("stats", home=home).stdout)
+    check(st.get("_raw_by_host") == {"work-mbp": 1, "home-desktop": 1}, "stats splits a merged vault by host")
+    pend = json.loads(run_util("pending", home=home).stdout)
+    check({d["host"] for d in pend["digests"]} == {"work-mbp", "home-desktop"}, "pending exposes host per digest")
+
+    # The new key sits inside the YAML block, so status rewriting must still
+    # find its anchor and must not disturb the line.
+    run_util("done", str(b), home=home)
+    text = b.read_text()[:600]
+    check("status: processed" in text and 'host: "home-desktop"' in text, "done leaves host intact")
+
+
 def test_perf(tmp: Path) -> None:
     print("\n[performance]")
     big = tmp / "big.jsonl"
@@ -425,16 +1100,74 @@ def test_perf(tmp: Path) -> None:
     check(len(r.stdout) < 20000, "digest stays small regardless of transcript size")
 
 
+def test_no_real_vault_writes(tmp: Path) -> None:
+    """The suite must be incapable of writing into the developer's own vault."""
+    print("\n[isolation]")
+    real_home = Path(os.path.expanduser("~"))
+    check(SCRATCH_HOME != real_home, "scratch HOME is not the real HOME")
+
+    env = sandbox_env(None)
+    check(env["HOME"] == str(SCRATCH_HOME), "default subprocess HOME is the scratch home")
+    check("OBSIDIAN_VAULT" not in env, "OBSIDIAN_VAULT is stripped from the test env")
+    check(
+        env["OBSIDIAN_DEV_JOURNAL_CONFIG"].startswith(str(SCRATCH_HOME)),
+        "config path is redirected into the scratch home",
+    )
+
+    # A real vault configured in the developer's real config must stay untouched
+    # even when capture is invoked exactly the way the leaking call did:
+    # no home=, --force, and a transcript that yields an empty digest.
+    real_cfg = real_home / ".claude" / "obsidian-dev-journal" / "config.json"
+    before = set()
+    real_raw = None
+    if real_cfg.is_file():
+        try:
+            vault = json.loads(real_cfg.read_text(encoding="utf-8")).get("vault_path") or ""
+            if vault:
+                real_raw = Path(vault) / "DevJournal" / "_raw"
+                before = {p.name for p in real_raw.glob("*.md")} if real_raw.is_dir() else set()
+        except Exception:
+            pass
+
+    (tmp / "iso.jsonl").write_text("not json\n{\n", encoding="utf-8")
+    run_capture("--transcript", str(tmp / "iso.jsonl"), "--force", "--session-id", "isolation-probe")
+
+    # The filename only carries the last 8 chars of the session id, so identify
+    # the probe by its frontmatter instead.
+    wrote = [
+        p
+        for p in SCRATCH_HOME.rglob("*.md")
+        if 'session_id: "isolation-probe"' in p.read_text(encoding="utf-8", errors="replace")[:600]
+    ]
+    check(bool(wrote), "the probe digest landed in the scratch home (so the write path ran)")
+    if real_raw is not None and real_raw.is_dir():
+        after = {p.name for p in real_raw.glob("*.md")}
+        check(after == before, "the real vault gained no files")
+    else:
+        check(True, "no real vault configured; nothing to protect")
+
+
 def main() -> int:
+    global SCRATCH_HOME
     m = load_capture()
     with tempfile.TemporaryDirectory() as td:
         tmp = Path(td)
+        SCRATCH_HOME = tmp / "_scratch_home"
+        (SCRATCH_HOME / ".claude" / "obsidian-dev-journal").mkdir(parents=True, exist_ok=True)
+        test_no_real_vault_writes(tmp)
         test_redaction(m)
         test_hostile_input(tmp)
         test_extraction(tmp)
         test_thresholds(tmp)
+        test_prompt_channels(m, tmp)
+        test_size_budget(m, tmp)
         test_worktree_and_git(tmp)
+        test_repo_attribution(m, tmp)
+        test_command_and_failure_capture(tmp)
+        test_part_digest(tmp)
+        test_session_identity_and_states(tmp)
         test_vault_workflow(tmp)
+        test_host_field(m, tmp)
         test_perf(tmp)
 
     print(f"\n{PASSES} passed, {len(FAILURES)} failed")

@@ -16,6 +16,7 @@ date: 2026-08-11
 repo: my-api          # 항상 정본 레포. worktree 이름을 넣지 않는다
 worktree: feat-x      # worktree에서 돈 세션만. 아니면 이 줄을 뺀다
 branch: feat/rate-limit
+host: work-mbp        # 다이제스트의 host: 를 그대로. 비어 있으면 이 줄을 뺀다
 duration: 1h 20m
 tags: [dev-journal, session, my-api]
 session_id: "a1b2c3d4"
@@ -46,6 +47,11 @@ session_id: "a1b2c3d4"
 
 If a section has no content, write `- 없음` rather than deleting the heading —
 consistent structure keeps the notes skimmable.
+
+`host:` must be carried over from the digest, not re-derived. Digests are
+archived out of the vault once processed (`journal_util.py prune`), so the
+session note is the only place that still knows which machine a session ran on
+— the thing you need if two vaults are ever merged into one.
 
 ---
 

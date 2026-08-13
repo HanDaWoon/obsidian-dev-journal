@@ -50,6 +50,11 @@ python3 "${CLAUDE_PLUGIN_ROOT}/scripts/journal_util.py" init --vault "<ABSOLUTE_
 This writes `~/.claude/obsidian-dev-journal/config.json`, creates the folder
 tree, and migrates any digests that were captured before setup finished.
 
+If the user works on more than one machine, mention `host_name` in the config:
+each digest records which machine it came from, it cannot be reconstructed
+later, and it is what makes merging two machines' vaults possible down the road.
+Default is the hostname's first label, which is usually fine.
+
 Optional flags: `--folder <name>` (default `DevJournal`),
 `--min-prompts N` (skip sessions shorter than N prompts, default 2),
 `--exclude <substr> ...` (never journal work under these paths — use for client

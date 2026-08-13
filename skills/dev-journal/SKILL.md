@@ -6,7 +6,7 @@ description: >
   "write my dev journal", "정리해줘" about recent coding sessions, asks what they decided
   or learned this week, wants their Obsidian journal updated or caught up, or asks to
   process pending session digests.
-allowed-tools: Bash, Read, Write, Edit, Glob, Grep
+allowed-tools: Bash, Read, Write, Edit, Glob, Grep, AskUserQuestion
 ---
 
 # Dev Journal — Synthesis
@@ -44,7 +44,8 @@ If nothing is configured (`vault_ok: false` from `doctor`), run the
 
 ### 2. Read a batch
 
-Process at most 8 digests per pass. Prefer the oldest unprocessed ones.
+Use the `suggested_batch` from `pending` (it scales with the backlog: 8 normally,
+up to 16 when a large backfill is queued). Prefer the oldest unprocessed ones.
 
 ```bash
 python3 "${CLAUDE_PLUGIN_ROOT}/scripts/journal_util.py" cat <path1> <path2> ...
@@ -89,17 +90,36 @@ Dataview.
 
 Rules that matter:
 
-- Always write a `Sessions/` note for each processed digest. It is the anchor
-  everything else links back to.
+- Write a `Sessions/` note for each **unit of work**, and link every digest it
+  covers in the note's 흔적/trace section. Usually that is one note per digest.
+  **Merge digests into one note when they are one unit of work** — filing 15
+  notes for 15 slices of the same thing buries the signal:
+  - **same `session_id`, different files** — one session whose checkout was
+    renamed mid-flight (newer captures dedupe this, older digests may not)
+  - **dispatched workers of one wave** — Orca/subagent sessions that start at
+    the same timestamp in the same repo, each holding one slice. Name the wave,
+    list what each worker produced.
+  - **trivial harness invocations** — e.g. commit-message generation: several
+    1-turn digests with no file edits. One stub note, all digests listed.
+  Never merge across repos, and never merge sessions that are days apart.
+  A merged note must still name every digest it consumed.
 - **Worktrees**: file `Projects/` and `Learnings/` notes under the digest's
   `repo` field, never under `worktree`. Sessions from `main`, `feat-x`, and
   `.worktrees/hotfix` of one repo all feed the same `Projects/<repo>.md`.
   Mention the worktree in the session note only (it explains parallel work),
   and set `worktree:` in that note's frontmatter when present.
+- Copy the digest's `host:` into the session note's frontmatter verbatim (omit
+  the line when the digest has none). Processed digests get archived out of the
+  vault, so the session note becomes the only record of which machine ran it.
 - If a digest has `repo_name_guessed: true`, its checkout no longer exists and
   the repo name may actually be a worktree's directory name. Do not create a new
   `Projects/` note from it — check whether an existing project note is the real
-  home, and ask the user if it is ambiguous.
+  home, and ask the user (`AskUserQuestion`) if it is ambiguous.
+- If a digest has `part: N` in its frontmatter, the session kept running after an
+  earlier digest of it was already synthesised. The part file re-reads the
+  **whole** transcript, so it overlaps a note that already exists. Find that note
+  (the earlier digest's `notes:` field names it), extend it with what is new, and
+  do not write a second session note for the same session.
 - Filenames: `Sessions/YYYY-MM-DD-<repo>-<slug>.md`,
   `Decisions/YYYY-MM-DD-<slug>.md`, `Learnings/<Topic Name>.md`,
   `Projects/<repo>.md`.
@@ -119,21 +139,47 @@ Rules that matter:
 
 ### 5. Close out
 
-Mark exactly the digests you processed:
+Mark exactly the digests you processed, recording which notes came out of them.
+`--note` is repeatable and applies to every digest listed, which is what you
+want for a merged note:
 
 ```bash
-python3 "${CLAUDE_PLUGIN_ROOT}/scripts/journal_util.py" done <path1> <path2> ...
+python3 "${CLAUDE_PLUGIN_ROOT}/scripts/journal_util.py" done <path1> <path2> \
+  --note "<vault>/DevJournal/Sessions/2026-08-11-repo-wave.md"
+```
+
+If the user asks to defer a digest rather than synthesise it (its repo lives on
+another machine, it is out of scope), park it instead of leaving it pending
+forever — a parked digest drops out of `pending` and keeps its reason:
+
+```bash
+python3 "${CLAUDE_PLUGIN_ROOT}/scripts/journal_util.py" hold <path> --reason "..."
 ```
 
 Then report to the user, briefly:
 
-- how many sessions were processed, and how many are still pending
+- how many sessions were processed, how many are still pending, and how many
+  are parked (`held` in the `pending` output)
 - the notes created vs. updated, as clickable paths
 - the achievement bullets added, quoted in full — this is the part they care
   about most and will want to edit
 - anything you deliberately skipped, and why
 
 If digests remain pending, offer to run another batch.
+
+On the very first pass in a vault, also create the entry point once:
+
+```bash
+python3 "${CLAUDE_PLUGIN_ROOT}/scripts/journal_util.py" index
+```
+
+`_raw/` is a queue, not an archive. If it has grown past a few hundred files,
+offer to retire the ones that have already become notes — they move out of the
+vault (reversibly) so Obsidian stops indexing them. Never run this unasked:
+
+```bash
+python3 "${CLAUDE_PLUGIN_ROOT}/scripts/journal_util.py" prune --older-than 90 --dry-run
+```
 
 ## Achievement bullets
 

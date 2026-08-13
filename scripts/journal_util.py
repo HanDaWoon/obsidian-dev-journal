@@ -8,6 +8,11 @@ Keeps the LLM's job small: one call to find work, one call to close it out.
     journal_util.py pending [--limit N]    # unprocessed digests (JSON)
     journal_util.py cat FILE [FILE ...]    # concatenate digests for reading
     journal_util.py done FILE [FILE ...]   # mark digests processed
+                       [--note PATH ...]   # ...and record which notes came out
+    journal_util.py hold FILE [FILE ...]   # park a digest: not pending, not done
+    journal_util.py unhold FILE [FILE ...] # put it back in the queue
+    journal_util.py index                  # (re)write the vault's index note
+    journal_util.py prune [--older-than N] # archive processed digests out of the vault
     journal_util.py backfill [--limit N]   # digest past sessions from ~/.claude/projects
     journal_util.py stats                  # what's in the journal so far
 """
@@ -71,6 +76,49 @@ def frontmatter(path: Path) -> dict:
 
 
 # --------------------------------------------------------------------------- #
+def set_status(path: Path, status: str, extra: "list[str] | None" = None,
+               allow_from: "set[str] | None" = None) -> str:
+    """Rewrite status inside the frontmatter block only.
+
+    Substring replacement over the whole file can hit a captured prompt or a
+    mid-body horizontal rule, so everything is anchored to the YAML block.
+    Returns "" on success, else a reason.
+    """
+    if not path.is_file():
+        return "missing"
+    text = path.read_text(encoding="utf-8", errors="replace")
+    m = re.match(r"\A---\n(.*?)\n---\n", text, re.S)
+    if not m:
+        return "no frontmatter"
+    fm = m.group(1)
+    cur = re.search(r"^status: (.*)$", fm, re.M)
+    current = cur.group(1).strip() if cur else "unprocessed"
+    if current == status:
+        return "already " + status
+    if allow_from is not None and current not in allow_from:
+        return "status is '" + current + "'"
+    block = "status: " + status
+    for line in extra or []:
+        block += "\n" + line
+    if cur:
+        fm = re.sub(r"^status: .*$", block, fm, count=1, flags=re.M)
+    else:
+        fm = block + "\n" + fm
+    # Re-stamping must not pile up duplicate keys from an earlier run.
+    for key in [e.split(":", 1)[0] for e in (extra or [])]:
+        seen = 0
+        out_lines = []
+        for line in fm.splitlines():
+            if line.startswith(key + ":"):
+                seen += 1
+                if seen > 1:
+                    continue
+            out_lines.append(line)
+        fm = "\n".join(out_lines)
+    path.write_text("---\n" + fm + "\n---\n" + text[m.end():], encoding="utf-8")
+    return ""
+
+
 def cmd_init(args) -> int:
     vault = Path(os.path.expanduser(args.vault)).resolve()
     if not vault.is_dir():
@@ -92,6 +140,7 @@ def cmd_init(args) -> int:
 
     base = vault / cfg["base_folder"]
     created = []
+    base.mkdir(parents=True, exist_ok=True)
     for sub in SUBFOLDERS:
         d = base / sub
         if not d.is_dir():
@@ -130,6 +179,7 @@ def cmd_init(args) -> int:
                 "config": str(CONFIG_PATH),
                 "base": str(base),
                 "created": created,
+                "index_note": write_index(base, cfg["base_folder"]),
                 "migrated_digests": moved,
             },
             indent=2,
@@ -218,10 +268,14 @@ def cmd_doctor(_args) -> int:
 def cmd_pending(args) -> int:
     cfg = load_config()
     items = []
+    held = 0
     for d in raw_dirs(cfg):
         for f in sorted(d.glob("*.md")):
             meta = frontmatter(f)
-            if meta.get("status", "unprocessed") != "unprocessed":
+            status = meta.get("status", "unprocessed")
+            if status == "held":
+                held += 1
+            if status != "unprocessed":
                 continue
             try:
                 size = f.stat().st_size
@@ -231,6 +285,7 @@ def cmd_pending(args) -> int:
                 {
                     "path": str(f),
                     "repo": meta.get("repo", ""),
+                    "host": meta.get("host", ""),
                     "started": meta.get("started", ""),
                     "duration": meta.get("duration", ""),
                     "turns": meta.get("turns", ""),
@@ -240,9 +295,26 @@ def cmd_pending(args) -> int:
                 }
             )
     items.sort(key=lambda i: i["started"])
+    total = len(items)
     if args.limit:
         items = items[: args.limit]
-    print(json.dumps({"count": len(items), "digests": items}, indent=2, ensure_ascii=False))
+    # A fixed batch of 8 means 17 passes on a 130-digest backlog. Scale the
+    # suggestion with the queue, but keep it bounded — the cap exists so one
+    # synthesis pass stays inside a comfortable context.
+    suggested = 8 if total <= 24 else (12 if total <= 60 else 16)
+    print(
+        json.dumps(
+            {
+                "count": total,
+                "returned": len(items),
+                "held": held,
+                "suggested_batch": min(suggested, total) or 0,
+                "digests": items,
+            },
+            indent=2,
+            ensure_ascii=False,
+        )
+    )
     return 0
 
 
@@ -258,34 +330,34 @@ def cmd_cat(args) -> int:
 
 
 def cmd_done(args) -> int:
-    """Flip status→processed inside the frontmatter block only. Substring
-    replacement over the whole file can hit a captured prompt or a mid-body
-    horizontal rule; anchor everything to the YAML block."""
+    """Mark digests processed, optionally recording the notes they produced.
+
+    The back-reference matters because synthesis is not 1:1 — one Orca wave of
+    15 dispatched workers is honestly one session note. Without `notes:` the
+    only record of "which digest became which note" is prose the model happened
+    to type into the note body.
+    """
     stamp = datetime.now().strftime("%Y-%m-%d")
+    notes = [str(n) for n in (args.note or [])]
+    extra = ["processed: " + stamp]
+    if notes:
+        extra.append("notes: [" + ", ".join('"' + n.replace('"', "") + '"' for n in notes) + "]")
+
     updated, already, skipped = [], [], []
     for p in args.files:
-        path = Path(p)
-        if not path.is_file():
-            skipped.append(p)
-            continue
-        text = path.read_text(encoding="utf-8", errors="replace")
-        m = re.match(r"\A---\n(.*?)\n---\n", text, re.S)
-        if not m:
-            skipped.append(f"{p} (no frontmatter)")
-            continue
-        fm = m.group(1)
-        if re.search(r"^status: processed$", fm, re.M):
+        # A parked digest must not be marked processed by accident: `pending`
+        # already hides it, so anything reaching here is either an explicit path
+        # or a stale one. Refuse and say so — unhold is one command away.
+        why = set_status(Path(p), "processed", extra, allow_from={"unprocessed"})
+        if not why:
+            updated.append(p)
+        elif why.startswith("already"):
             already.append(p)
-            continue
-        if re.search(r"^status: ", fm, re.M):
-            fm = re.sub(r"^status: .*$", f"status: processed\nprocessed: {stamp}", fm, count=1, flags=re.M)
         else:
-            fm = f"status: processed\nprocessed: {stamp}\n" + fm
-        path.write_text(f"---\n{fm}\n---\n" + text[m.end() :], encoding="utf-8")
-        updated.append(p)
+            skipped.append(p + " (" + why + ")")
     print(
         json.dumps(
-            {"marked": updated, "already_processed": already, "skipped": skipped},
+            {"marked": updated, "already_processed": already, "skipped": skipped, "notes": notes},
             indent=2,
             ensure_ascii=False,
         )
@@ -293,23 +365,63 @@ def cmd_done(args) -> int:
     return 0
 
 
+def cmd_hold(args) -> int:
+    """Park a digest without synthesising it.
+
+    Two states (unprocessed/processed) could not express "deliberately deferred"
+    — a digest whose repo lives on another machine stayed in `pending` forever,
+    indistinguishable from a backlog.
+    """
+    stamp = datetime.now().strftime("%Y-%m-%d")
+    extra = ["held: " + stamp]
+    if args.reason:
+        extra.append('hold_reason: "' + args.reason.replace('"', "") + '"')
+    held, skipped = [], []
+    for p in args.files:
+        why = set_status(Path(p), "held", extra, allow_from={"unprocessed", "held"})
+        (held if not why else skipped).append(p if not why else p + " (" + why + ")")
+    print(json.dumps({"held": held, "skipped": skipped, "reason": args.reason},
+                     indent=2, ensure_ascii=False))
+    return 0
+
+
+def cmd_unhold(args) -> int:
+    back, skipped = [], []
+    for p in args.files:
+        why = set_status(Path(p), "unprocessed", [], allow_from={"held"})
+        (back if not why else skipped).append(p if not why else p + " (" + why + ")")
+    print(json.dumps({"returned_to_queue": back, "skipped": skipped},
+                     indent=2, ensure_ascii=False))
+    return 0
+
+
+CWD_RE = re.compile(r'"cwd"\s*:\s*"((?:[^"\\]|\\.){1,512})"')
+
+
 def transcript_cwd(path: Path) -> str:
-    """First cwd recorded in a transcript. Each git worktree has its own cwd, so
-    this is what distinguishes worktree sessions from main-checkout ones."""
+    """The directory a transcript belongs to. Each git worktree has its own cwd,
+    so this is what distinguishes worktree sessions from main-checkout ones.
+
+    Modal, not first — same rule as capture_session.resolve_cwd(). This used to
+    read the first cwd while capture_session kept the last, so `backfill --repo`
+    and the digest it produced could disagree about the same session. Scanned
+    with a regex rather than json.loads: backfill calls this for every candidate
+    transcript and some are tens of megabytes.
+    """
+    counts: dict[str, int] = {}
     try:
         with path.open("r", encoding="utf-8", errors="replace") as fh:
-            for i, line in enumerate(fh):
-                if i > 200:
-                    break
-                try:
-                    obj = json.loads(line)
-                except Exception:
-                    continue
-                if isinstance(obj, dict) and obj.get("cwd"):
-                    return obj["cwd"]
+            for line in fh:
+                m = CWD_RE.search(line)
+                if m:
+                    cwd = m.group(1).replace("\\/", "/").replace('\\"', '"').replace("\\\\", "\\")
+                    counts[cwd] = counts.get(cwd, 0) + 1
     except Exception:
         pass
-    return ""
+    if not counts:
+        return ""
+    order = {c: i for i, c in enumerate(counts)}
+    return max(counts, key=lambda c: (counts[c], -order[c]))
 
 
 def cmd_backfill(args) -> int:
@@ -424,6 +536,184 @@ def cmd_backfill(args) -> int:
     return 0
 
 
+INDEX_NOTE = """# Dev Journal
+
+> `obsidian-dev-journal` 이 관리하는 볼트의 진입점. Dataview 플러그인이 필요하다.
+> 이 파일은 `journal_util.py index` 로 다시 만들 수 있다.
+
+## 최근 세션
+```dataview
+TABLE repo, duration, date
+FROM #dev-journal AND "{base}/Sessions"
+SORT date DESC
+LIMIT 25
+```
+
+## 결정 로그
+```dataview
+TABLE repo, status, date
+FROM #decision
+SORT date DESC
+```
+
+## 프로젝트
+```dataview
+TABLE repo, sessions, last_updated
+FROM #project
+SORT last_updated DESC
+```
+
+## 흔들리는 지식 (복습 필요)
+```dataview
+LIST
+FROM #learning
+WHERE confidence = "shaky"
+SORT last_updated ASC
+```
+
+## 최근 갱신된 학습
+```dataview
+TABLE last_updated, confidence
+FROM #learning
+SORT last_updated DESC
+LIMIT 15
+```
+
+## 처리 대기 중인 다이제스트
+```dataview
+LIST
+FROM "{base}/_raw"
+WHERE status = "unprocessed"
+```
+
+## 보류한 다이제스트
+```dataview
+TABLE hold_reason, held
+FROM "{base}/_raw"
+WHERE status = "held"
+```
+"""
+
+
+def write_index(base: Path, folder: str, force: bool = False) -> "str | None":
+    """The index is the vault's entry point. 89 session notes with no way in is
+    a filing cabinet nobody opens."""
+    target = base / "DevJournal.md"
+    if target.exists() and not force:
+        return None
+    target.write_text(INDEX_NOTE.replace("{base}", folder), encoding="utf-8")
+    return str(target)
+
+
+def cmd_index(args) -> int:
+    cfg = load_config()
+    base = base_dir(cfg)
+    if not base:
+        print(json.dumps({"ok": False, "error": "vault not configured; run init"}))
+        return 1
+    written = write_index(base, cfg.get("base_folder") or "DevJournal", force=args.force)
+    print(
+        json.dumps(
+            {
+                "ok": True,
+                "written": written,
+                "note": None if written else "index already exists; pass --force to overwrite",
+            },
+            indent=2,
+            ensure_ascii=False,
+        )
+    )
+    return 0
+
+
+def cmd_prune(args) -> int:
+    """Retire digests that have already been synthesised.
+
+    `_raw/` is an input queue, but nothing ever emptied it: 133 processed
+    digests (846KB of verbatim prompts and command lines) accumulate inside the
+    vault, where Obsidian indexes them into search and the graph forever. The
+    notes are the product; the digests are the receipt.
+
+    Archiving moves them *out of the vault* — that is the point, so an Obsidian
+    search stops matching them — while keeping them on disk and reversible.
+    Only `processed` files are eligible: `held` and `unprocessed` are still
+    work in hand.
+    """
+    cfg = load_config()
+    dirs = raw_dirs(cfg)
+    if not dirs:
+        print(json.dumps({"ok": False, "error": "no digest folder found; run init"}))
+        return 1
+
+    cutoff = datetime.now().timestamp() - max(0, args.older_than) * 86400
+    archive = STATE_DIR / "archive"
+    picked, kept = [], 0
+    for d in dirs:
+        for f in sorted(d.glob("*.md")):
+            meta = frontmatter(f)
+            if meta.get("status") != "processed":
+                kept += 1
+                continue
+            # Age from the day it was synthesised, not the day it was captured:
+            # a backfilled March session processed yesterday is one day old as
+            # far as "do I still need this receipt" goes.
+            when = None
+            try:
+                when = datetime.strptime(meta.get("processed", ""), "%Y-%m-%d").timestamp()
+            except ValueError:
+                pass
+            if when is None:
+                try:
+                    when = f.stat().st_mtime
+                except OSError:
+                    continue
+            if when > cutoff:
+                kept += 1
+                continue
+            picked.append(f)
+
+    moved, deleted, failed = [], [], []
+    if not args.dry_run:
+        if not args.delete:
+            archive.mkdir(parents=True, exist_ok=True)
+        for f in picked:
+            try:
+                if args.delete:
+                    f.unlink()
+                    deleted.append(f.name)
+                else:
+                    target = archive / f.name
+                    n = 2
+                    while target.exists():
+                        target = archive / (f.stem + "-" + str(n) + f.suffix)
+                        n += 1
+                    f.replace(target)
+                    moved.append(str(target))
+            except OSError as exc:
+                failed.append(f.name + " (" + str(exc) + ")")
+
+    print(
+        json.dumps(
+            {
+                "ok": True,
+                "dry_run": bool(args.dry_run),
+                "older_than_days": args.older_than,
+                "eligible": len(picked),
+                "kept": kept,
+                "archived_to": None if args.delete else str(archive),
+                "archived": moved,
+                "deleted": deleted,
+                "failed": failed,
+                "candidates": [f.name for f in picked] if args.dry_run else [],
+                "note": "held and unprocessed digests are never pruned",
+            },
+            indent=2,
+            ensure_ascii=False,
+        )
+    )
+    return 0
+
+
 def cmd_stats(_args) -> int:
     cfg = load_config()
     base = base_dir(cfg)
@@ -437,10 +727,18 @@ def cmd_stats(_args) -> int:
     raw = base / "_raw"
     if raw.is_dir():
         states: dict[str, int] = {}
+        # Host counts only become interesting after two machines' vaults are
+        # merged; digests captured before the field existed group under "".
+        hosts: dict[str, int] = {}
         for f in raw.glob("*.md"):
-            s = frontmatter(f).get("status", "unprocessed")
+            meta = frontmatter(f)
+            s = meta.get("status", "unprocessed")
             states[s] = states.get(s, 0) + 1
+            h = meta.get("host", "")
+            hosts[h] = hosts.get(h, 0) + 1
         out["_raw_by_status"] = states
+        if len(hosts) > 1 or (hosts and "" not in hosts):
+            out["_raw_by_host"] = hosts
     print(json.dumps(out, indent=2, ensure_ascii=False))
     return 0
 
@@ -468,7 +766,22 @@ def main() -> int:
 
     p = sub.add_parser("done")
     p.add_argument("files", nargs="+")
+    p.add_argument("--note", action="append", default=None,
+                   help="note this digest produced; repeatable, applies to all listed digests")
     p.set_defaults(fn=cmd_done)
+
+    p = sub.add_parser("hold", help="park a digest: excluded from pending, not processed")
+    p.add_argument("files", nargs="+")
+    p.add_argument("--reason", default="", help="why it is parked")
+    p.set_defaults(fn=cmd_hold)
+
+    p = sub.add_parser("unhold")
+    p.add_argument("files", nargs="+")
+    p.set_defaults(fn=cmd_unhold)
+
+    p = sub.add_parser("index", help="(re)write the vault index note")
+    p.add_argument("--force", action="store_true")
+    p.set_defaults(fn=cmd_index)
 
     p = sub.add_parser("backfill")
     p.add_argument("--limit", type=int, default=25, help="0 = no limit")
@@ -476,6 +789,12 @@ def main() -> int:
     p.add_argument("--repo", default="", help="substring filter on the session's working dir")
     p.add_argument("--dry-run", action="store_true", help="list what would be digested")
     p.set_defaults(fn=cmd_backfill)
+
+    p = sub.add_parser("prune", help="retire already-synthesised digests out of the vault")
+    p.add_argument("--older-than", type=int, default=90, help="days since synthesis (default 90)")
+    p.add_argument("--delete", action="store_true", help="delete instead of archiving")
+    p.add_argument("--dry-run", action="store_true")
+    p.set_defaults(fn=cmd_prune)
 
     p = sub.add_parser("stats"); p.set_defaults(fn=cmd_stats)
 

@@ -25,9 +25,23 @@ Sessions · Decisions · Learnings · Projects · Career 노트
 세션마다 요약 LLM을 돌리는 방식과 비교해 코딩 중 추가 비용이 0이고, 합성은
 8개 세션당 1회로 묶인다. 12MB transcript 파싱에 0.3초.
 
-다이제스트에 담기는 것: 내가 입력한 프롬프트 원문, AskUserQuestion으로 고른
-선택지, 승인한 계획, 수정한 파일, 실행한 의미 있는 명령, 부딪힌 에러, 세션 중
-만든 커밋. 해석은 하지 않는다.
+다이제스트에 담기는 것: 내가 입력한 프롬프트 원문, 세션 recap(어시스턴트가 만든
+요약 — 출처를 구분해 별도 섹션에 담는다), AskUserQuestion으로 고른 선택지, 승인한
+계획, 수정한 파일, 실행한 의미 있는 명령, 부딪힌 에러, 세션 중 만든 커밋.
+해석은 하지 않는다.
+
+프롬프트는 사용자가 실제로 한 말만 남는다. 큐에 들어갔다 전달되며 두 번 기록되는
+입력, `<task-notification>` 같은 harness 주입 텍스트는 걸러진다(실측 기준 캡처량의
+절반).
+
+에러 섹션에는 훅이 실패로 표시한 것뿐 아니라 **출력이 실패로 보이는 명령**도 들어간다
+(traceback, `N failed`, `command not found` 등). 후자는 `_(inferred from output)_`
+로 표시되므로 읽는 쪽에서 가려낼 수 있다.
+
+다이제스트 상태는 셋이다: `unprocessed` → `processed`, 그리고 의도적으로 미룬
+`held`(`hold --reason`). 보류한 것은 `pending`에서 빠지되 따로 집계된다.
+합성이 끝난 다이제스트는 `prune`으로 볼트 밖으로 물릴 수 있다 — `_raw/`는 큐지
+보관소가 아니다.
 
 ## 설치
 
@@ -92,6 +106,10 @@ worktree 경로를 돌려주기 때문에 그대로 쓰면 `feat-x`, `hotfix`가
 한 레포의 모든 worktree가 `Projects/my-api.md` 하나로 모인다. worktree 이름은
 세션 노트에만 남는다(병렬 작업의 맥락이라서).
 
+세션이 레포의 **하위 디렉터리**에서 시작해도(`my-api/tests`) 정본 레포로 귀속된다.
+그리고 세션의 레포는 **가장 오래 머문 디렉터리** 기준이다 — 마지막에 `cd` 한 곳이
+아니다.
+
 **한 가지 한계**: worktree를 이미 삭제했다면 git에 어느 레포였는지 물어볼 수 없다.
 그런 다이제스트는 `repo_name_guessed: true`와 경고가 붙고 디렉터리 이름을 레포
 이름으로 쓴다. 합성 전에 `repo:` 필드를 직접 고치면 된다.
@@ -103,6 +121,29 @@ python3 $S/journal_util.py backfill --since-days 90        # 최근 것만
 python3 $S/journal_util.py backfill --limit 0              # 전부
 ```
 
+## 여러 볼트를 나중에 하나로 합치기
+
+머신마다(또는 회사/개인으로) 볼트를 따로 쓰다가 나중에 합치는 건 된다. 다이제스트는
+자기완결적이고, 중복 판정이 파일명이 아니라 frontmatter의 `session_id`(UUID)라
+`_raw/`끼리 그냥 옮겨 붙여도 어긋나지 않는다.
+
+합치기 전에 알아둘 것:
+
+- **머신 이름은 소급이 안 된다.** `host:` 필드는 캡처 시점에만 알 수 있다. 합칠
+  가능성이 있으면 지금 머신마다 `host_name`을 지정해 두는 게 낫다. 이미 캡처된
+  다이제스트는 `host: ""`로 남는다(`journal_util.py stats`가 호스트별로 세어준다).
+- **레포 이름이 겹칠 수 있다.** 레포 식별은 `--git-common-dir`의 basename이라,
+  양쪽 볼트의 서로 다른 `api`가 하나의 `Projects/api.md`로 합쳐진다. 합치기 전에
+  한쪽을 리네임한다.
+- **이름이 곧 키인 노트**는 수동 병합이 필요하다: `Learnings/<주제>.md`,
+  `Projects/<repo>.md`. 둘 다 날짜 섹션을 덧붙이는 구조라 본문 합치기는 기계적이다.
+  `Sessions/`와 `Decisions/`는 날짜+슬러그라 충돌이 드물다.
+- 합친 뒤 `journal_util.py index --force`로 인덱스 노트를 다시 쓴다. Dataview
+  쿼리에 `base_folder` 경로가 박혀 있어서, 볼트마다 폴더 이름이 달랐다면 필요하다.
+
+순서: `_raw/` 이동 → `pending`으로 미합성분 확인 → `/dev-journal` → 동명 노트 병합
+→ `index --force`.
+
 ## 설정
 
 `~/.claude/obsidian-dev-journal/config.json`
@@ -111,10 +152,18 @@ python3 $S/journal_util.py backfill --limit 0              # 전부
 | --- | --- | --- |
 | `vault_path` | `""` | Obsidian 볼트 절대경로. `OBSIDIAN_VAULT` 환경변수로도 가능 |
 | `base_folder` | `DevJournal` | 볼트 안에서 이 플러그인이 쓰는 폴더 |
+| `host_name` | `""` | 다이제스트에 남길 머신 이름. 비우면 호스트네임의 첫 라벨(`mbp.local` → `mbp`) |
 | `min_user_prompts` | `2` | 이보다 짧은 세션은 건너뛴다 |
+| `min_files_touched` | `0` | 프롬프트가 적어도 이만큼 파일을 고쳤으면 기록한다. **하한이 아니라 추가 통과 조건**이고, 최소 1로 바닥이 잡힌다 |
 | `exclude_paths` | `[]` | 이 경로 아래 작업은 절대 기록하지 않는다 |
 | `redact` | `true` | 명령/프롬프트에서 시크릿 패턴 마스킹 |
+| `extra_commands` | `""` | 기록할 명령 목록을 넓히는 정규식. 도메인 도구용 (`\b(daml\|sui\|vast)\b`) |
 | `max_prompts` / `max_commands` / `max_digest_chars` | 40 / 40 / 14000 | 다이제스트 크기 상한 |
+| `max_recaps` / `max_recap_chars` | 12 / 400 | 세션 recap 섹션 상한 |
+
+상한에 걸리면 꼬리를 자르지 않고 **섹션별로 깎는다** — 값싼 것부터(외부 조회 →
+서브에이전트 → 명령 → 프롬프트 → recap → 계획 → 파일 → 에러 → 질문). 커밋 목록은
+깎지 않는다.
 
 ## 알아둘 것
 
@@ -134,7 +183,7 @@ python3 $S/journal_util.py backfill --limit 0              # 전부
 ## 개발
 
 ```bash
-python3 tests/test_capture.py     # 회귀 스위트 53건, 의존성 없음
+python3 tests/test_capture.py     # 회귀 스위트 168건, 의존성 없음
 ```
 
 설계 근거와 깨면 안 되는 제약은 `CLAUDE.md`에 있다. 코드를 고치기 전에 읽는다.
@@ -146,7 +195,11 @@ S=~/.claude/plugins/*/obsidian-dev-journal/scripts   # 설치 위치에 맞게
 
 python3 $S/journal_util.py doctor                    # 상태 점검
 python3 $S/journal_util.py init --vault ~/MyVault    # 설정
-python3 $S/journal_util.py pending                   # 대기 중인 다이제스트
+python3 $S/journal_util.py pending                   # 대기 중인 다이제스트 (+ 배치 제안)
+python3 $S/journal_util.py hold <f> --reason "..."   # 의도적으로 미루기
+python3 $S/journal_util.py unhold <f>                # 다시 큐로
+python3 $S/journal_util.py index                     # 볼트 인덱스 노트 생성
+python3 $S/journal_util.py prune --older-than 90 --dry-run   # 합성 끝난 다이제스트 정리
 python3 $S/journal_util.py backfill --limit 20       # 과거 세션 소급
 python3 $S/journal_util.py stats                     # 현황
 
