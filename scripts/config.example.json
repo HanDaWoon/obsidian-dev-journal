@@ -1,0 +1,16 @@
+{
+  "vault_path": "/Users/you/Documents/MyVault",
+  "base_folder": "DevJournal",
+  "min_user_prompts": 2,
+  "min_files_touched": 0,
+  "exclude_paths": [
+    "/Users/you/work/client-private"
+  ],
+  "redact": true,
+  "max_prompts": 40,
+  "max_prompt_chars": 600,
+  "max_commands": 40,
+  "max_files": 60,
+  "max_errors": 15,
+  "max_digest_chars": 14000
+}

@@ -1,0 +1,13 @@
+{
+  "name": "dev-journal",
+  "owner": {
+    "name": "handawoon"
+  },
+  "plugins": [
+    {
+      "name": "obsidian-dev-journal",
+      "source": "./",
+      "description": "Claude Code 세션을 Obsidian 노트로 자동 기록 — 결정, 배움, 이력서용 성과"
+    }
+  ]
+}
