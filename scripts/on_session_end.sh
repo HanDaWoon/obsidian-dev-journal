@@ -15,11 +15,20 @@ mkdir -p "${STATE_DIR}/pending" "${STATE_DIR}/logs" 2>/dev/null || true
 # Housekeeping (cheap, bounded):
 # - cap each log at ~512KB by keeping the newest half when it overflows
 # - remove payloads older than a day (orphans from runs that never completed)
+#
+# The rotation truncates in place (`cat >`) instead of `mv`-ing a new file over
+# the old one. A capture from a previous session may still be running with the
+# log open in append mode: replacing the inode leaves it writing to a file that
+# no longer has a name, so that session's log — the one `doctor` reports as
+# last_capture_log_line — vanishes exactly when something went wrong.
 for lf in "${STATE_DIR}/logs/capture.log" "${STATE_DIR}/logs/hook.log"; do
   if [ -f "$lf" ]; then
     sz=$(wc -c <"$lf" 2>/dev/null || echo 0)
     if [ "${sz:-0}" -gt 524288 ]; then
-      tail -c 262144 "$lf" >"${lf}.tmp.$$" 2>/dev/null && mv "${lf}.tmp.$$" "$lf"
+      if tail -c 262144 "$lf" >"${lf}.tmp.$$" 2>/dev/null; then
+        cat "${lf}.tmp.$$" >"$lf" 2>/dev/null
+      fi
+      rm -f "${lf}.tmp.$$" 2>/dev/null || true
     fi
   fi
 done

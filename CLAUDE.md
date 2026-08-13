@@ -248,14 +248,14 @@ fallback 인 `"session"` 이 **모든 다이제스트의 호스트가 되어버�
 | `skills/dev-journal-setup/` | 볼트 연결, 진단, backfill 안내 |
 | `skills/career-review/` | 이력서 불릿·성과 리뷰·성장 회고 |
 | `hooks/hooks.json` | SessionEnd + PreCompact. `${CLAUDE_PLUGIN_ROOT}` 사용 |
-| `tests/test_capture.py` | 회귀 스위트 184건. 의존성 없음 |
+| `tests/test_capture.py` | 회귀 스위트 197건. 의존성 없음 |
 
 상태는 전부 홈 디렉터리에 있다: `~/.claude/obsidian-dev-journal/`(config.json,
 logs/, pending/, staged/). 리포에는 코드만 들어간다.
 
 ## 작업 규칙
 
-- **수정 후 반드시** `python3 tests/test_capture.py` — 184건 전부 통과해야 한다.
+- **수정 후 반드시** `python3 tests/test_capture.py` — 197건 전부 통과해야 한다.
   테스트 케이스마다 어떤 버그를 붙잡고 있는지 주석이 있다. 근거를 모르고 삭제하지
   말 것.
 - 훅/스킬 파일을 고치면 Claude Code에서 `/plugin update` 또는 `/reload-plugins`

@@ -122,6 +122,11 @@ def test_redaction(m) -> None:
         ("Bearer sk-abcdefghijklmnop1234", "sk-abc"),
         ("OAUTH_TOKEN=xyz789 ./run.sh", "xyz789"),
         ("credentials: hunter2", "hunter2"),                        # plural keyword
+        # A quoted flag value may contain spaces. The value pattern stopped at
+        # the first space, so everything after it stayed in the digest.
+        ("aws --secret-key 'abc def ghi'", "def"),
+        ('deploy --api-key "part1 part2"', "part2"),
+        ('curl --token "abc', "abc"),                               # unterminated quote
         # False positives: these must pass through untouched.
         ("git log --author=handawoon --oneline", None),
         ('git commit --author="Han <h@x.io>"', None),
@@ -143,6 +148,18 @@ def test_redaction(m) -> None:
             check(got == text, f"untouched: {text[:44]}")
         else:
             check(leak not in got, f"redacted:  {text[:44]}")
+
+    # Absence of the secret is not enough — a substitution can mangle the line
+    # around it and every case above only asserts that the value is gone. That
+    # gap shipped a `--password None«redacted»` (wrong capture group) once.
+    exact = [
+        ("aws --secret-key 'abc def'", "aws --secret-key '«redacted»'"),
+        ("mysql --password hunter2 -u root", "mysql --password «redacted» -u root"),
+        ('curl --api-key "abc123" https://x', 'curl --api-key "«redacted»" https://x'),
+        ("export API_KEY=abc123 && ./run", "export API_KEY=«redacted» && ./run"),
+    ]
+    for text, want in exact:
+        check(m.redact(text) == want, "exact form: " + want)
 
     # Linear-time guarantee. A leading `.*` in the secret regex once made this
     # 58s on a 12MB transcript; keep the two-stage design.
@@ -994,6 +1011,9 @@ def test_vault_workflow(tmp: Path) -> None:
     check("status: processed" in digests[0].read_text()[:400], "done flips frontmatter status")
     r2 = json.loads(run_util("done", str(digests[0]), home=home).stdout)
     check(len(r2["already_processed"]) == 1, "done is idempotent")
+    # Status rewriting goes through tmp + os.replace like the capture path: an
+    # in-place rewrite of a file inside a synced vault can be read half-written.
+    check(not list(raw.glob(".*tmp*")), "done writes atomically and leaves no temp file")
 
     # A processed digest must never be clobbered by a later capture.
     run_capture("--transcript", str(rich), "--cwd", "/repo/d", "--session-id", "d1", home=home)
@@ -1025,6 +1045,43 @@ def test_vault_workflow(tmp: Path) -> None:
     check("_raw_by_status" in json.loads(run_util("stats", home=home).stdout), "stats works")
 
 
+def test_init_migration_resilience(tmp: Path) -> None:
+    """A vault it cannot write to must not leave setup half-finished.
+
+    Only the collision branch of the staged-digest migration was guarded, so an
+    unwritable `_raw/` aborted init *after* it had created the folders and
+    written the config — with the staged digests partly moved and no report of
+    what failed.
+    """
+    print("\n[init migration resilience]")
+    if os.geteuid() == 0:
+        print("  SKIP  running as root; chmod would not deny writes")
+        return
+    home = tmp / "home_init"
+    (home / ".claude").mkdir(parents=True)
+    vault = home / "VI"
+    (vault / ".obsidian").mkdir(parents=True)
+    run_util("init", "--vault", str(vault), home=home)
+
+    staged = home / ".claude" / "obsidian-dev-journal" / "staged"
+    staged.mkdir(parents=True, exist_ok=True)
+    digest = staged / "2026-08-13--repo--stagedig.md"
+    digest.write_text('---\nstatus: unprocessed\nturns: 4\n---\n본문\n', encoding="utf-8")
+
+    raw = vault / "DevJournal" / "_raw"
+    raw.chmod(0o500)
+    try:
+        r = json.loads(run_util("init", "--vault", str(vault), home=home).stdout)
+    finally:
+        raw.chmod(0o700)
+    check(r.get("ok") is True, "init survives an unwritable vault instead of crashing")
+    check(len(r.get("migration_failed") or []) == 1, "init reports the digest it could not migrate")
+    check(digest.is_file(), "the staged digest is left in place so a later init can retry")
+
+    r2 = json.loads(run_util("init", "--vault", str(vault), home=home).stdout)
+    check(r2["migrated_digests"] == 1 and not r2["migration_failed"], "retry migrates it once the vault is writable")
+
+
 def test_host_field(m, tmp: Path) -> None:
     """Which machine a session ran on is capture-time-only information.
 
@@ -1038,6 +1095,8 @@ def test_host_field(m, tmp: Path) -> None:
     check(m.host_name({"host_name": "work-mbp"}) == "work-mbp", "config host_name wins over the hostname")
     check("." not in m.host_name({}), "auto host keeps the first label only (mbp.local flips to .lan on another network)")
     check(m.host_name({"host_name": 'a"b c'}) == "a-b-c", "host is slugified, so it cannot break the YAML block")
+
+    check(m.host_name({"host_name": "###"}) == "", "a hostname with nothing usable in it yields '', not 'session'")
 
     real_gethostname = m.socket.gethostname
     try:
@@ -1167,6 +1226,7 @@ def main() -> int:
         test_part_digest(tmp)
         test_session_identity_and_states(tmp)
         test_vault_workflow(tmp)
+        test_init_migration_resilience(tmp)
         test_host_field(m, tmp)
         test_perf(tmp)
 

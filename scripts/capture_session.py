@@ -142,10 +142,16 @@ ASSIGN_TAIL_RE = re.compile(
 # The lookbehind makes the dash start a real flag. Without it the "-keygen" of
 # `ssh-keygen -R host` matched as a flag and the *next word* was redacted —
 # observed in the vault, where it ate the host being removed.
+#
+# The quoted branch comes first and consumes the closing quote, because a value
+# is allowed to contain spaces: `--secret-key 'abc def'` used to redact only up
+# to the space and leave `'«redacted» def'` in the digest. The unquoted branch
+# still tolerates a stray opening quote, so an unterminated `--key "abc` is
+# masked rather than skipped.
 FLAG_SECRET_RE = re.compile(
     r"(?i)((?<![A-Za-z0-9])--?[A-Za-z0-9-]*(?:key|token|secret|password|passwd|credential)[A-Za-z0-9-]*|"
     r"\bset\s+[A-Za-z0-9_]*(?:key|token|secret|password)[A-Za-z0-9_]*)"
-    r"\s+([\"']?)([^\s\"']{1,200})"
+    r"\s+(?:([\"'])([^\"']{1,200})\2|([\"']?)([^\s\"']{1,200}))"
 )
 BEARER_RE = re.compile(r"(?i)\b(bearer|basic)\s+([A-Za-z0-9._+/=\-]{8,})|\b(token)\s+([A-Za-z0-9._\-]{12,})")
 # Credentials embedded in connection strings: postgres://user:pw@host
@@ -255,7 +261,17 @@ def redact(text: str, enabled: bool = True) -> str:
         pos = end
     out.append(text[pos:])
     text = "".join(out)
-    text = FLAG_SECRET_RE.sub(lambda m: f"{m.group(1)} {m.group(2)}«redacted»", text)
+    # Groups: 1 flag, 2/3 quote+value (quoted branch), 4/5 stray quote+value
+    # (unquoted branch). The quoted branch consumed its closing quote, so put it
+    # back; the unquoted branch never had one to consume.
+    text = FLAG_SECRET_RE.sub(
+        lambda m: (
+            f"{m.group(1)} {m.group(2)}«redacted»{m.group(2)}"
+            if m.group(2)
+            else f"{m.group(1)} {m.group(4) or ''}«redacted»"
+        ),
+        text,
+    )
     text = USER_PW_RE.sub(lambda m: f"{m.group(1)}{m.group(2)}{m.group(3)}:«redacted»", text)
     text = URL_CRED_RE.sub(lambda m: m.group(1) + ":«redacted»@", text)
     return BLOB_RE.sub("«redacted»", text)
@@ -526,7 +542,10 @@ def host_name(cfg: dict) -> str:
             name = (socket.gethostname() or "").split(".")[0]
         except OSError:  # no hostname is not a reason to lose the digest
             name = ""
-    return slugify(name)[:40] if name.strip() else ""
+    # Sanitised here rather than through slugify(), whose "session" fallback for
+    # an empty result would turn a junk hostname into a plausible-looking host
+    # on every digest. Inventing a machine is worse than admitting to none.
+    return re.sub(r"[^A-Za-z0-9가-힣._-]+", "-", name).strip("-.")[:40]
 
 
 # --------------------------------------------------------------------------- #
@@ -844,14 +863,20 @@ def _section(name: str, title: str, items: list, more: str, dropped: int = 0) ->
     }
 
 
-def _shrink(sec: dict, floor: int, keep_edges: bool) -> int:
-    """Remove one item. Returns the characters freed, or 0 if at the floor."""
+def _shrink(sec: dict, floor: int, keep_edges: bool) -> bool:
+    """Remove one item. Returns False when the section is already at its floor.
+
+    Deliberately does *not* report how many characters it freed: the caller must
+    re-measure instead. Dropping the first item of a section adds a "…N more"
+    marker line, so a caller that subtracts the item's length undercounts and
+    stops trimming early — see fit_sections().
+    """
     if len(sec["items"]) <= floor:
-        return 0
+        return False
     idx = len(sec["items"]) // 2 if keep_edges else len(sec["items"]) - 1
-    freed = len(sec["items"].pop(idx)) + 1
+    sec["items"].pop(idx)
     sec["dropped"] += 1
-    return freed
+    return True
 
 
 def render_section(sec: dict) -> list[str]:

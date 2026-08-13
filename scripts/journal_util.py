@@ -115,7 +115,20 @@ def set_status(path: Path, status: str, extra: "list[str] | None" = None,
                     continue
             out_lines.append(line)
         fm = "\n".join(out_lines)
-    path.write_text("---\n" + fm + "\n---\n" + text[m.end():], encoding="utf-8")
+    # tmp + os.replace, same as the capture path: these files live in a synced
+    # vault, so an in-place rewrite can be read half-written by Obsidian or the
+    # sync client, and a crash mid-write loses the frontmatter outright.
+    new_text = "---\n" + fm + "\n---\n" + text[m.end():]
+    tmp = path.with_name("." + path.name + "." + str(os.getpid()) + ".tmp")
+    try:
+        tmp.write_text(new_text, encoding="utf-8")
+        os.replace(tmp, path)
+    except OSError as exc:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        return "write failed: " + str(exc)
     return ""
 
 
@@ -151,26 +164,34 @@ def cmd_init(args) -> int:
     # file behind — `pending` scans both dirs and a leftover means the same
     # session is synthesised twice, forever.
     moved = 0
+    migration_failed = []
     staged = STATE_DIR / "staged"
+
+    def turns_of(p: Path) -> int:
+        m = re.search(r"^turns: (\d+)$", p.read_text(encoding="utf-8", errors="replace")[:600], re.M)
+        return int(m.group(1)) if m else -1
+
     if staged.is_dir():
         for f in staged.glob("*.md"):
-            target = base / "_raw" / f.name
-            if target.exists():
-                # Same session captured on both sides: keep the richer digest.
-                def turns_of(p: Path) -> int:
-                    m = re.search(r"^turns: (\d+)$", p.read_text(encoding="utf-8", errors="replace")[:600], re.M)
-                    return int(m.group(1)) if m else -1
-                try:
+            # Every file is guarded, not just the collision branch: an
+            # unwritable vault used to abort init here, leaving the folders
+            # created, the config written and the staged digests half migrated.
+            try:
+                target = base / "_raw" / f.name
+                if target.exists():
+                    # Same session captured on both sides: keep the richer digest.
                     if turns_of(f) > turns_of(target):
                         target.write_text(f.read_text(encoding="utf-8"), encoding="utf-8")
                         moved += 1
-                except Exception:
-                    pass
+                    f.unlink()
+                    continue
+                target.write_text(f.read_text(encoding="utf-8"), encoding="utf-8")
                 f.unlink()
-                continue
-            target.write_text(f.read_text(encoding="utf-8"), encoding="utf-8")
-            f.unlink()
-            moved += 1
+                moved += 1
+            except Exception as exc:
+                # Leave the staged copy in place — `pending` still finds it and
+                # a later init can retry.
+                migration_failed.append(f.name + " (" + str(exc) + ")")
 
     print(
         json.dumps(
@@ -181,6 +202,7 @@ def cmd_init(args) -> int:
                 "created": created,
                 "index_note": write_index(base, cfg["base_folder"]),
                 "migrated_digests": moved,
+                "migration_failed": migration_failed,
             },
             indent=2,
             ensure_ascii=False,
