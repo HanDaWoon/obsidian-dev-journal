@@ -1045,6 +1045,47 @@ def test_vault_workflow(tmp: Path) -> None:
     check("_raw_by_status" in json.loads(run_util("stats", home=home).stdout), "stats works")
 
 
+def test_doctor_sees_every_copy(tmp: Path) -> None:
+    """Two copies at different versions write different digests into one vault.
+
+    The cached snapshot of this plugin lives six levels under ~/.claude/plugins
+    (cache/<marketplace>/<plugin>/<version>/.claude-plugin/plugin.json) and the
+    crawl stopped at five, so doctor reported one healthy install while a second
+    runtime was really executing a two-versions-old copy — the exact failure the
+    command exists to surface.
+    """
+    print("\n[doctor: multiple plugin copies]")
+    home = tmp / "home_doc"
+    cache = home / ".claude" / "plugins" / "cache" / "dev-journal" / "obsidian-dev-journal" / "0.1.0"
+    (cache / ".claude-plugin").mkdir(parents=True)
+    (cache / "hooks").mkdir()
+    (cache / ".claude-plugin" / "plugin.json").write_text(
+        json.dumps({"name": "obsidian-dev-journal", "version": "0.1.0"}), encoding="utf-8"
+    )
+    (cache / "hooks" / "hooks.json").write_text("{}", encoding="utf-8")
+    (home / ".claude" / "plugins" / "installed_plugins.json").write_text(
+        json.dumps({"plugins": {"obsidian-dev-journal@dev-journal": [
+            {"scope": "user", "installPath": str(cache), "version": "0.1.0"}]}}),
+        encoding="utf-8",
+    )
+
+    d = json.loads(run_util("doctor", home=home).stdout)
+    paths = {i["path"] for i in d["plugin_installs_found"]}
+    check(str(cache) in paths, "the cached copy six levels down is found")
+    check(d["plugin_version_running"] == json.loads(
+        (ROOT / ".claude-plugin" / "plugin.json").read_text())["version"],
+        "the running copy reports the working tree's version")
+    check([i["version"] for i in d["plugin_version_mismatch"]] == ["0.1.0"], "the stale copy is named as a mismatch")
+    check(bool(d["version_note"]), "doctor says what to do about it")
+
+    # A registry entry pointing at a directory that no longer exists is still a
+    # runtime aimed at nothing — report it rather than silently dropping it.
+    shutil.rmtree(cache)
+    d2 = json.loads(run_util("doctor", home=home).stdout)
+    gone = [i for i in d2["plugin_installs_found"] if i["path"] == str(cache)]
+    check(len(gone) == 1 and gone[0]["exists"] is False, "a registered copy whose directory is gone is still reported")
+
+
 def test_init_migration_resilience(tmp: Path) -> None:
     """A vault it cannot write to must not leave setup half-finished.
 
@@ -1226,6 +1267,7 @@ def main() -> int:
         test_part_digest(tmp)
         test_session_identity_and_states(tmp)
         test_vault_workflow(tmp)
+        test_doctor_sees_every_copy(tmp)
         test_init_migration_resilience(tmp)
         test_host_field(m, tmp)
         test_perf(tmp)

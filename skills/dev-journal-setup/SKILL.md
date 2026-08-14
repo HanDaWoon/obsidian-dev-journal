@@ -67,7 +67,11 @@ python3 "${CLAUDE_PLUGIN_ROOT}/scripts/journal_util.py" doctor
 ```
 
 Check the report: `vault_ok: true`, folders present, `hooks_json_present: true`,
-and `plugin_installs_found` non-empty. Plugin hooks load when Claude Code starts,
+and `plugin_installs_found` non-empty. If `plugin_version_mismatch` is not empty,
+say so before anything else: a second copy of the plugin at another version is
+installed, whichever copy a runtime loads is the one that captures, and the two
+write different digests into the same vault. `/plugin update obsidian-dev-journal`
+(or reinstall) is the fix. Plugin hooks load when Claude Code starts,
 so after a fresh install tell the user to restart (or `/reload-plugins`) and that
 the *next* session will be the first one captured. `last_capture_log_line` shows
 whether capture has ever fired; `stale_pending_payloads` above ~5 suggests the
@@ -131,6 +135,7 @@ synthesis.
 | `python3 not found` in hook.log | Install Python 3, or point the hook at an interpreter that exists |
 | Digest is nearly empty | Transcript format may have changed in a Claude Code update; inspect a few lines with `head -3 <transcript> \| python3 -m json.tool` and report which keys moved |
 | Sessions being skipped | Below the signal threshold — lower `min_user_prompts` in the config |
+| Digests inconsistent between sessions (some missing sections) | `doctor` → `plugin_version_mismatch`. Different runtimes can load different copies of the plugin |
 | Secrets appearing in digests | `redact` catches `key=`/`token:` patterns only. Add the repo to `exclude_paths` for anything sensitive |
 
 ## Privacy note to surface once during setup

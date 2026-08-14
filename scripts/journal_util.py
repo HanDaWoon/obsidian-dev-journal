@@ -32,6 +32,7 @@ STATE_DIR = Path(os.path.expanduser("~/.claude/obsidian-dev-journal"))
 CONFIG_PATH = Path(os.environ.get("OBSIDIAN_DEV_JOURNAL_CONFIG") or STATE_DIR / "config.json")
 SCRIPT_DIR = Path(__file__).resolve().parent
 SUBFOLDERS = ["_raw", "Sessions", "Decisions", "Learnings", "Projects", "Career"]
+PLUGIN_NAME = "obsidian-dev-journal"
 
 
 def load_config() -> dict:
@@ -211,12 +212,49 @@ def cmd_init(args) -> int:
     return 0
 
 
-def find_plugin_installs() -> list[str]:
-    """Locate installed copies of this plugin. Hooks shipped by a plugin never
-    appear in settings.json, so 'is the hook wired up' means 'is the plugin
-    installed and does its hooks.json exist'."""
-    hits = []
-    # The running copy (journal_util.py lives in <plugin>/scripts/).
+def plugin_manifest(root: Path) -> dict:
+    try:
+        data = json.loads((root / ".claude-plugin" / "plugin.json").read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def install_registry() -> dict:
+    """installPath -> version, as Claude Code recorded it at install time."""
+    reg: dict[str, str] = {}
+    path = Path(os.path.expanduser("~/.claude/plugins/installed_plugins.json"))
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        for key, entries in (data.get("plugins") or {}).items():
+            if key.split("@")[0] != PLUGIN_NAME:
+                continue
+            for entry in entries or []:
+                if isinstance(entry, dict) and entry.get("installPath"):
+                    reg[str(Path(entry["installPath"]))] = entry.get("version") or ""
+    except Exception:
+        pass
+    return reg
+
+
+def find_plugin_installs() -> list[dict]:
+    """Every copy of this plugin that could run, with its version.
+
+    Hooks shipped by a plugin never appear in settings.json, so 'is the hook
+    wired up' means 'is a copy installed and does its hooks.json exist'.
+
+    Copies disagree in practice, which is the whole point of reporting them
+    individually. A marketplace with a `directory` source runs the working tree,
+    while the registry still points at the snapshot cached when the plugin was
+    first added — and a second runtime (local agent mode) executes that
+    snapshot. Observed here: hooks writing digests from 0.5.0 while
+    installed_plugins.json said 0.3.1 and one runtime really used the old one.
+
+    The snapshot was invisible before: its manifest sits six levels below
+    ~/.claude/plugins (cache/<marketplace>/<plugin>/<version>/.claude-plugin/),
+    and the crawl stopped at five — so doctor reported a healthy single install
+    for exactly the situation it exists to catch.
+    """
     here = SCRIPT_DIR.parent
     candidates = {here}
     for root in (
@@ -225,17 +263,32 @@ def find_plugin_installs() -> list[str]:
     ):
         if root.is_dir():
             for mf in root.glob("**/.claude-plugin/plugin.json"):
-                if len(mf.parts) - len(root.parts) > 5:
-                    continue  # don't crawl deep trees
+                if len(mf.parts) - len(root.parts) > 8:
+                    continue  # bounded, but deep enough to reach the cache
                 candidates.add(mf.parent.parent)
-    for c in candidates:
-        mf = c / ".claude-plugin" / "plugin.json"
-        try:
-            if json.loads(mf.read_text(encoding="utf-8")).get("name") == "obsidian-dev-journal":
-                hits.append(str(c))
-        except Exception:
+
+    registry = install_registry()
+    candidates.update(Path(p) for p in registry)
+
+    hits = []
+    for c in sorted(candidates, key=str):
+        registered = registry.get(str(c))
+        manifest = plugin_manifest(c)
+        # A registry entry whose directory is gone still matters: that is a
+        # runtime pointed at nothing.
+        if manifest.get("name") != PLUGIN_NAME and registered is None:
             continue
-    return sorted(hits)
+        hits.append(
+            {
+                "path": str(c),
+                "version": manifest.get("version") or registered or "",
+                "registered_version": registered,
+                "exists": bool(manifest),
+                "running": c == here,
+                "hooks_json": (c / "hooks" / "hooks.json").is_file(),
+            }
+        )
+    return hits
 
 
 def cmd_doctor(_args) -> int:
@@ -243,7 +296,10 @@ def cmd_doctor(_args) -> int:
     base = base_dir(cfg)
 
     installs = find_plugin_installs()
-    hooks_ok = [p for p in installs if (Path(p) / "hooks" / "hooks.json").is_file()]
+    hooks_ok = [i for i in installs if i["hooks_json"]]
+    running = next((i for i in installs if i["running"]), None)
+    versions = sorted({i["version"] for i in installs if i["version"]})
+    stale = [i for i in installs if i["version"] and running and i["version"] != running["version"]]
 
     pending = 0
     for d in raw_dirs(cfg):
@@ -272,11 +328,26 @@ def cmd_doctor(_args) -> int:
         "staged_local": str(STATE_DIR / "staged"),
         "pending_digests": pending,
         "plugin_installs_found": installs,
+        "plugin_version_running": running["version"] if running else None,
+        "plugin_versions_seen": versions,
+        # Two copies at different versions write different digests into one
+        # vault, and which one runs depends on the runtime that fired the hook.
+        "plugin_version_mismatch": [
+            {"path": i["path"], "version": i["version"]} for i in stale
+        ],
         "hooks_json_present": bool(hooks_ok),
         "hook_note": (
             "Plugin hooks load on Claude Code start — after installing, restart or /reload-plugins."
             if hooks_ok
             else "No installed copy with hooks/hooks.json found; capture will not fire."
+        ),
+        "version_note": (
+            "Another copy is at a different version than the one answering this command. "
+            "Whichever copy a runtime loads is the one that captures — run `/plugin update "
+            + PLUGIN_NAME
+            + "` (or reinstall) so they match."
+            if stale
+            else None
         ),
         "last_capture_log_line": last_capture,
         "stale_pending_payloads": orphans,
