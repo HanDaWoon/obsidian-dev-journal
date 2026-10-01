@@ -1522,6 +1522,115 @@ def test_doctor_flags_config_mistakes(tmp: Path) -> None:
 
 
 
+def test_git_autocommit(tmp: Path) -> None:
+    """`done` closes every synthesis pass, so it is where the journal gets committed.
+
+    The vault here is one repo with the journal inside it, and something else is
+    already staged — the commit must take the journal folder and nothing else.
+    """
+    print("\n[done: git autocommit]")
+    home = tmp / "gac"
+    (home / ".claude").mkdir(parents=True)
+    vault = home / "V"
+    (vault / ".obsidian").mkdir(parents=True)
+    run_util("init", "--vault", str(vault), home=home)
+    cfg_path = home / ".claude" / "obsidian-dev-journal" / "config.json"
+
+    def set_cfg(**kw) -> None:
+        cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
+        cfg.update(kw)
+        cfg_path.write_text(json.dumps(cfg), encoding="utf-8")
+
+    def git(*a: str, cwd: Path = vault) -> subprocess.CompletedProcess:
+        return subprocess.run(["git", "-C", str(cwd), *a], capture_output=True, text=True,
+                              env=sandbox_env(home))
+
+    base = vault / "DevJournal"
+    n = [0]
+
+    def synthesise() -> tuple[Path, Path]:
+        n[0] += 1
+        digest = base / "_raw" / f"2026-10-01--repo--g{n[0]}.md"
+        digest.write_text(f"---\nstatus: unprocessed\nsession_id: \"g{n[0]}\"\n---\n\nbody\n",
+                          encoding="utf-8")
+        note = base / "Sessions" / f"2026-10-01-repo-g{n[0]}.md"
+        note.write_text("---\ntype: session\n---\n\n# g\n", encoding="utf-8")
+        return digest, note
+
+    remote = tmp / "gac-remote.git"
+    subprocess.run(["git", "init", "-q", "--bare", "-b", "main", str(remote)], capture_output=True)
+    git("init", "-q", "-b", "main")
+    git("config", "user.name", "t")
+    git("config", "user.email", "t@example.com")
+    (vault / "other.md").write_text("v1\n", encoding="utf-8")
+    git("add", "other.md")
+    git("commit", "-q", "-m", "init")
+    git("remote", "add", "origin", str(remote))
+    git("push", "-q", "-u", "origin", "main")
+    (vault / "other.md").write_text("v2\n", encoding="utf-8")
+    git("add", "other.md")  # the user's own staged work, outside the journal
+
+    # Off by default: nothing is committed behind the user's back.
+    d, note = synthesise()
+    head = git("rev-parse", "HEAD").stdout
+    rep = json.loads(run_util("done", str(d), "--note", str(note), home=home).stdout)
+    check("git" not in rep and git("rev-parse", "HEAD").stdout == head,
+          "without git_autocommit, done does not commit")
+
+    set_cfg(git_autocommit=True)
+    d, note = synthesise()
+    r = run_util("done", str(d), "--note", str(note), home=home)
+    rep = json.loads(r.stdout)
+    g = rep.get("git", {})
+    check(g.get("committed") and g.get("pushed"), "done commits and pushes the journal")
+    shown = git("show", "--name-only", "--format=%s%n%b", "HEAD").stdout
+    check(shown.startswith("dev-journal: synthesise 1 digest"), "commit subject counts the digests")
+    check("- Sessions/2026-10-01-repo-g2.md" in shown,
+          "commit body lists the notes, relative to the journal folder")
+    check("DevJournal/Sessions/2026-10-01-repo-g1.md" in shown,
+          "notes written before autocommit was on are swept in, not lost")
+    check("other.md" not in shown, "the commit is scoped to the journal folder")
+    check("other.md" in git("diff", "--cached", "--name-only").stdout,
+          "the user's staged work outside the journal stays staged")
+    check(git("rev-parse", "main", cwd=remote).stdout == git("rev-parse", "HEAD").stdout,
+          "the remote has the commit")
+
+    rep = json.loads(run_util("done", str(d), home=home).stdout)
+    check(rep["git"].get("reason") == "nothing to commit", "a no-op done does not make an empty commit")
+
+    # A push failure must not undo or hide the local work.
+    git("remote", "set-url", "origin", str(tmp / "nowhere.git"))
+    d, note = synthesise()
+    r = run_util("done", str(d), "--note", str(note), home=home)
+    g = json.loads(r.stdout)["git"]
+    check(r.returncode == 0 and g["committed"] and g["pushed"] is False and g.get("push_error"),
+          "a failed push is reported, the commit stays, done still succeeds")
+    check("status: processed" in d.read_text()[:200], "digests are marked even when the push fails")
+
+    # Doctor: autocommit that cannot do anything has to say so.
+    set_cfg(git_autocommit="true")
+    problems = " ".join(json.loads(run_util("doctor", home=home).stdout)["config_problems"])
+    check("git_autocommit should be true or false" in problems, "a quoted boolean is reported")
+
+    home2 = tmp / "gac2"
+    (home2 / ".claude").mkdir(parents=True)
+    vault2 = home2 / "V"
+    (vault2 / ".obsidian").mkdir(parents=True)
+    run_util("init", "--vault", str(vault2), home=home2)
+    cfg2 = home2 / ".claude" / "obsidian-dev-journal" / "config.json"
+    cfg = json.loads(cfg2.read_text(encoding="utf-8"))
+    cfg["git_autocommit"] = True
+    cfg2.write_text(json.dumps(cfg), encoding="utf-8")
+    rep = json.loads(run_util("doctor", home=home2).stdout)
+    check("not inside a git repository" in " ".join(rep["config_problems"]),
+          "autocommit on a journal outside any repo is reported")
+    d2 = vault2 / "DevJournal" / "_raw" / "x.md"
+    d2.write_text("---\nstatus: unprocessed\n---\n", encoding="utf-8")
+    r = run_util("done", str(d2), home=home2)
+    check(r.returncode == 0 and json.loads(r.stdout)["git"]["committed"] is False,
+          "done outside a repo still marks digests and does not crash")
+
+
 def test_topics_map(tmp: Path) -> None:
     """Topic notes were only linked *from* sessions, so they never met."""
     print("\n[topics map]")
@@ -1608,6 +1717,7 @@ def main() -> int:
         test_pending_exposes_skill_fields(tmp)
         test_backfill_unknown_cwd(tmp)
         test_doctor_flags_config_mistakes(tmp)
+        test_git_autocommit(tmp)
         test_topics_map(tmp)
         test_perf(tmp)
 

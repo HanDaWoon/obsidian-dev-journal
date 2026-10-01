@@ -168,6 +168,12 @@ python3 $S/journal_util.py backfill --limit 0              # 전부
 | `extra_commands` | `""` | 기록할 명령 목록을 넓히는 정규식. 도메인 도구용 (`\b(daml\|sui\|vast)\b`) |
 | `max_prompts` / `max_commands` / `max_digest_chars` | 40 / 40 / 14000 | 다이제스트 크기 상한 |
 | `max_recaps` / `max_recap_chars` | 12 / 400 | 세션 recap 섹션 상한 |
+| `git_autocommit` | `false` | `done` 이 끝날 때 저널 폴더를 커밋한다. 폴더(또는 볼트)가 git 레포여야 한다. 커밋은 저널 폴더로만 한정된다 |
+| `git_push` | `true` | `git_autocommit` 이 켜져 있고 브랜치에 upstream 이 있으면 커밋 뒤 푸시한다. 푸시 실패는 `done` 을 실패시키지 않고 출력의 `git.push_error` 로 보고된다 |
+
+`git_autocommit` 을 쓸 때는 저널 폴더의 `.gitignore` 에 `_raw/` 를 넣는 것을 권한다 —
+다이제스트는 큐라서 `prune` 으로 볼트를 떠나고, 명령줄과 에러 출력이 거의 그대로 들어 있다.
+`doctor` 의 `journal_git` 이 어느 레포·브랜치·upstream 으로 커밋되는지 보여준다.
 
 상한에 걸리면 꼬리를 자르지 않고 **섹션별로 깎는다** — 값싼 것부터(외부 조회 →
 서브에이전트 → 명령 → 프롬프트 → recap → 계획 → 파일 → 에러 → 질문). 커밋 목록은

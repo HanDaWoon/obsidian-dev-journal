@@ -341,25 +341,42 @@ Dataview 로 들어가 있다.
 다이제스트를 위키링크로 참조하지 않는 것도 의도적이다 — `prune`(20번) 이 볼트
 밖으로 옮기는 순간 전부 깨진 링크가 된다. 평문 경로로 남긴다.
 
+### 30. 자동 커밋은 스킬 문장이 아니라 `done` 안에 있다
+"합성 끝나면 커밋해라" 를 SKILL.md 에만 쓰면 모델이 건너뛸 수 있고, 건너뛴 날의
+노트는 다음 커밋에 엉뚱한 메시지로 섞인다. `done` 은 모든 합성 패스를 닫는 유일한
+단계라 거기서 `git_sync()` 를 부른다. `git_autocommit: true` 일 때만(기본 꺼짐).
+규칙 넷:
+- **pathspec 으로 저널 폴더에 한정한다** (`git add -A -- .` + `git commit -- .`).
+  볼트 전체가 레포일 수 있고, 사용자가 볼트 다른 곳에 stage 해 둔 것은 우리 것이
+  아니다. `commit -- <path>` 는 `--only` 의미라 다른 staged 항목을 건드리지 않는다.
+- **git 실패는 `done` 을 실패시키지 않는다.** 다이제스트는 이미 processed 로 바뀐
+  뒤다. 에러는 출력의 `git` 객체로 보고하고 스킬이 사용자에게 한 줄로 전한다.
+- **TTY 가 없다.** Bash 툴 안에서 자격증명 프롬프트는 타임아웃까지 멈춘다.
+  `GIT_TERMINAL_PROMPT=0` + stdin `DEVNULL` + 타임아웃. `GIT_SSH_COMMAND` 는
+  **설정하지 않는다** — 그러면 계정별 키를 묶어 둔 사용자의 `core.sshCommand` 를 덮는다.
+- 따옴표 친 `"true"` 는 꺼진 것으로 읽힌다(진짜 bool 만 켠다). 그래서
+  `config_problems` 가 타입을 검사하고, `doctor` 가 레포·upstream 이 없으면 알린다 —
+  24번과 같은 원칙, 이름만 켜진 스위치는 진단에 나와야 한다.
+
 ## 파일 지도
 
 | 파일 | 역할 |
 | --- | --- |
 | `scripts/on_session_end.sh` | 훅 진입점. 즉시 반환 + 로그 회전 + 고아 페이로드 청소 |
 | `scripts/capture_session.py` | transcript → 다이제스트. LLM 미사용. 성능 민감 |
-| `scripts/journal_util.py` | CLI: init/doctor/pending/cat/done/hold/unhold/index/prune/backfill/topics/stats |
+| `scripts/journal_util.py` | CLI: init/doctor/pending/cat/done/hold/unhold/index/prune/backfill/topics/stats. `done` 은 자동 커밋도 한다(30번) |
 | `skills/dev-journal/` | 합성 스킬 + `references/note-templates.md` |
 | `skills/dev-journal-setup/` | 볼트 연결, 진단, backfill 안내 |
 | `skills/career-review/` | 이력서 불릿·성과 리뷰·성장 회고 |
 | `hooks/hooks.json` | SessionEnd + PreCompact. `${CLAUDE_PLUGIN_ROOT}` 사용 |
-| `tests/test_capture.py` | 회귀 스위트 259건. 의존성 없음 |
+| `tests/test_capture.py` | 회귀 스위트 273건. 의존성 없음 |
 
 상태는 전부 홈 디렉터리에 있다: `~/.claude/obsidian-dev-journal/`(config.json,
 logs/, pending/, staged/). 리포에는 코드만 들어간다.
 
 ## 작업 규칙
 
-- **수정 후 반드시** `python3 tests/test_capture.py` — 259건 전부 통과해야 한다.
+- **수정 후 반드시** `python3 tests/test_capture.py` — 273건 전부 통과해야 한다.
   테스트 케이스마다 어떤 버그를 붙잡고 있는지 주석이 있다. 근거를 모르고 삭제하지
   말 것.
 - 훅/스킬 파일을 고치면 Claude Code에서 `/plugin update` 또는 `/reload-plugins`

@@ -193,6 +193,12 @@ python3 "${CLAUDE_PLUGIN_ROOT}/scripts/journal_util.py" done <path1> <path2> \
   --note "<vault>/DevJournal/Sessions/2026-08-11-repo-wave.md"
 ```
 
+Run `done` only after every note of the batch is written: when the config has
+`git_autocommit: true`, `done` commits the journal folder and pushes it, and its
+output carries a `git` object. Do not run git yourself. If that object has
+`error` or `push_error`, tell the user in one line — the notes are safe locally,
+but the remote is behind.
+
 If the user asks to defer a digest rather than synthesise it (its repo lives on
 another machine, it is out of scope), park it instead of leaving it pending
 forever — a parked digest drops out of `pending` and keeps its reason:

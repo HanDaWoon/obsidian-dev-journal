@@ -9,6 +9,7 @@ Keeps the LLM's job small: one call to find work, one call to close it out.
     journal_util.py cat FILE [FILE ...]    # concatenate digests for reading
     journal_util.py done FILE [FILE ...]   # mark digests processed
                        [--note PATH ...]   # ...and record which notes came out
+                                           # (git_autocommit: commit + push the journal)
     journal_util.py hold FILE [FILE ...]   # park a digest: not pending, not done
     journal_util.py unhold FILE [FILE ...] # put it back in the queue
     journal_util.py index                  # (re)write the vault's index note
@@ -341,7 +342,35 @@ def config_problems(cfg: dict) -> list:
         for entry in raw_excludes:
             if not isinstance(entry, str) or not entry.strip():
                 problems.append(f"exclude_paths entry {entry!r} is not a usable path")
+    # `"git_autocommit": "true"` reads as off — `done` only commits on a real
+    # boolean, so a quoted one would leave the journal uncommitted forever.
+    for key in ("git_autocommit", "git_push"):
+        if key in cfg and not isinstance(cfg[key], bool):
+            problems.append(f"{key} should be true or false, not {cfg[key]!r}; "
+                            "it is treated as off")
     return problems
+
+
+def journal_git(base: "Path | None", cfg: dict) -> dict:
+    """Where `done` would commit to, so `git_autocommit` cannot be on in name only."""
+    info: dict = {"autocommit": cfg.get("git_autocommit") is True,
+                  "push": cfg.get("git_push", True) is not False}
+    if not base:
+        return info
+
+    def git(*a: str) -> str:
+        try:
+            cp = subprocess.run(["git", "-C", str(base), *a], capture_output=True, text=True,
+                                stdin=subprocess.DEVNULL, timeout=10)
+            return cp.stdout.strip() if cp.returncode == 0 else ""
+        except (OSError, subprocess.TimeoutExpired):
+            return ""
+
+    info["repo"] = git("rev-parse", "--show-toplevel") or None
+    if info["repo"]:
+        info["branch"] = git("rev-parse", "--abbrev-ref", "HEAD") or None
+        info["upstream"] = git("rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}") or None
+    return info
 
 
 def cmd_doctor(_args) -> int:
@@ -369,6 +398,15 @@ def cmd_doctor(_args) -> int:
         except Exception:
             pass
     orphans = len(list((STATE_DIR / "pending").glob("*.json"))) if (STATE_DIR / "pending").is_dir() else 0
+
+    git_info = journal_git(base, cfg)
+    problems = config_problems(cfg)
+    if git_info["autocommit"] and base and not git_info.get("repo"):
+        problems.append(f"git_autocommit is on but {base} is not inside a git repository; "
+                        "`done` will not commit anything")
+    elif git_info["autocommit"] and git_info["push"] and git_info.get("repo") and not git_info.get("upstream"):
+        problems.append("git_autocommit is on but the branch has no upstream; `done` commits "
+                        "without pushing (`git push -u origin <branch>` once to fix)")
 
     report = {
         "config_path": str(CONFIG_PATH),
@@ -410,7 +448,8 @@ def cmd_doctor(_args) -> int:
             for e in (cfg.get("exclude_paths") or [])
             if isinstance(e, str) and e.strip()
         ],
-        "config_problems": config_problems(cfg),
+        "config_problems": problems,
+        "journal_git": git_info,
         "last_capture_log_line": last_capture,
         "stale_pending_payloads": orphans,
         "python": sys.version.split()[0],
@@ -498,6 +537,78 @@ def cmd_cat(args) -> int:
     return 0
 
 
+GIT_TIMEOUT = 60
+
+
+def git_sync(base: Path, message: str, push: bool = True) -> dict:
+    """Commit the journal folder, then push if the branch tracks a remote.
+
+    Lives in `done` rather than in the skill's prose because it has to happen
+    every time, and an instruction the model can skip is not "every time".
+    Scoped to the journal folder with a pathspec: the vault may be one repo
+    with the journal inside it, and whatever the user has staged elsewhere is
+    not ours to commit. Nothing here may fail `done` — the digests are already
+    marked by the time this runs, so a git problem is reported, not raised.
+    """
+    # No TTY under the Bash tool: a credential prompt would hang until the
+    # timeout. GIT_SSH_COMMAND is left alone — setting it overrides the user's
+    # core.sshCommand, which is how per-account keys are often wired up.
+    env = dict(os.environ, GIT_TERMINAL_PROMPT="0")
+
+    def git(*a: str) -> subprocess.CompletedProcess:
+        return subprocess.run(["git", "-C", str(base), *a], capture_output=True, text=True,
+                              stdin=subprocess.DEVNULL, timeout=GIT_TIMEOUT, env=env)
+
+    def tail(cp: subprocess.CompletedProcess) -> str:
+        return ((cp.stderr or cp.stdout or "").strip().splitlines() or [""])[-1][:300]
+
+    out: dict = {"committed": False}
+    try:
+        if git("rev-parse", "--is-inside-work-tree").returncode != 0:
+            out["reason"] = "journal folder is not inside a git repository"
+            return out
+        add = git("add", "-A", "--", ".")
+        if add.returncode != 0:
+            out["error"] = "git add: " + tail(add)
+            return out
+        if git("diff", "--cached", "--quiet", "--", ".").returncode == 0:
+            out["reason"] = "nothing to commit"
+            return out
+        commit = git("commit", "-q", "-m", message, "--", ".")
+        if commit.returncode != 0:
+            out["error"] = "git commit: " + tail(commit)
+            return out
+        out["committed"] = True
+        out["commit"] = git("rev-parse", "--short", "HEAD").stdout.strip()
+        if not push:
+            return out
+        if git("rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}").returncode != 0:
+            out["pushed"] = False
+            out["push_skipped"] = "branch has no upstream"
+            return out
+        pushed = git("push", "-q")
+        out["pushed"] = pushed.returncode == 0
+        if pushed.returncode != 0:
+            out["push_error"] = tail(pushed)
+    except FileNotFoundError:
+        out["error"] = "git is not installed"
+    except subprocess.TimeoutExpired as exc:
+        out["error"] = f"git timed out after {GIT_TIMEOUT}s: {' '.join(exc.cmd[3:5])}"
+    return out
+
+
+def done_commit_message(marked: list, notes: list, base: Path) -> str:
+    def rel(n: str) -> str:
+        try:
+            return str(Path(n).resolve().relative_to(base.resolve()))
+        except (ValueError, OSError):
+            return n
+    lines = [f"dev-journal: synthesise {len(marked)} digest{'s' if len(marked) != 1 else ''}"]
+    if notes:
+        lines += [""] + ["- " + rel(n) for n in notes]
+    return "\n".join(lines) + "\n"
+
+
 def cmd_done(args) -> int:
     """Mark digests processed, optionally recording the notes they produced.
 
@@ -505,6 +616,9 @@ def cmd_done(args) -> int:
     15 dispatched workers is honestly one session note. Without `notes:` the
     only record of "which digest became which note" is prose the model happened
     to type into the note body.
+
+    With `git_autocommit` on, the journal folder is committed (and pushed) here,
+    because `done` is the one step that closes every synthesis pass.
     """
     stamp = datetime.now().strftime("%Y-%m-%d")
     notes = [str(n) for n in (args.note or [])]
@@ -524,13 +638,13 @@ def cmd_done(args) -> int:
             already.append(p)
         else:
             skipped.append(p + " (" + why + ")")
-    print(
-        json.dumps(
-            {"marked": updated, "already_processed": already, "skipped": skipped, "notes": notes},
-            indent=2,
-            ensure_ascii=False,
-        )
-    )
+    report = {"marked": updated, "already_processed": already, "skipped": skipped, "notes": notes}
+    cfg = load_config()
+    base = base_dir(cfg)
+    if cfg.get("git_autocommit") is True and base and base.is_dir():
+        report["git"] = git_sync(base, done_commit_message(updated, notes, base),
+                                 push=cfg.get("git_push", True) is not False)
+    print(json.dumps(report, indent=2, ensure_ascii=False))
     return 0
 
 
