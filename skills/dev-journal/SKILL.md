@@ -36,6 +36,11 @@ Scripts live in `${CLAUDE_PLUGIN_ROOT}/scripts/`. Run with `python3`.
 python3 "${CLAUDE_PLUGIN_ROOT}/scripts/journal_util.py" pending
 ```
 
+`pending` lists the **oldest 40** by default and always reports the true total
+in `count` (`truncated: true` when the list was cut). That bound exists because
+this output goes straight into context: an unbounded queue of 1600 digests
+rendered 634KB of JSON. Never pass `--limit 0` here — it is for scripting.
+
 If `count` is 0: report that everything is caught up, show
 `journal_util.py stats`, and stop. Do not invent notes.
 
@@ -51,12 +56,20 @@ up to 16 when a large backfill is queued). Prefer the oldest unprocessed ones.
 python3 "${CLAUDE_PLUGIN_ROOT}/scripts/journal_util.py" cat <path1> <path2> ...
 ```
 
-Before writing to `Projects/` or `Learnings/`, read the existing note for that
+Before writing to `Projects/` or `Learnings/`, find the existing note for that
 repo or topic so you extend it instead of duplicating it:
 
 ```bash
-ls "<vault>/DevJournal/Projects" "<vault>/DevJournal/Learnings"
+ls "<vault>/DevJournal/Projects"
+python3 "${CLAUDE_PLUGIN_ROOT}/scripts/journal_util.py" topics --query "<subject>"
 ```
+
+`topics` returns every `Learnings/` note with its `## 핵심` gist, tags, and the
+topic notes it already links to — enough to tell "extend this one" from "write a
+new one", and enough to pick neighbours for the linking rule below, without
+opening 40 files. Filter with `--query` (it matches names, gists and tags);
+run it bare only when you need the whole map. `isolated_count` is how many
+topic notes no other topic note reaches.
 
 ### 3. Judge before you write
 
@@ -111,6 +124,8 @@ Rules that matter:
 - Copy the digest's `host:` into the session note's frontmatter verbatim (omit
   the line when the digest has none). Processed digests get archived out of the
   vault, so the session note becomes the only record of which machine ran it.
+- Each entry in `pending` carries `part` and `repo_name_guessed`, so the two
+  rules below can be applied before opening anything.
 - If a digest has `repo_name_guessed: true`, its checkout no longer exists and
   the repo name may actually be a worktree's directory name. Do not create a new
   `Projects/` note from it — check whether an existing project note is the real
@@ -125,10 +140,40 @@ Rules that matter:
   `Projects/<repo>.md`.
 - Cross-link with wikilinks in both directions. A decision links to its session;
   the session lists its decisions.
+- Use the Obsidian affordances the templates carry, and only those:
+  **`aliases:`** on `Projects/` and `Learnings/` so a repo or topic called by
+  another name still resolves to one note instead of forking into two;
+  **callouts** (`> [!warning]`, `> [!tip]`) for traps and invariants only —
+  everywhere is nowhere; **`- [ ]` checkboxes** for 남은 일, because the index
+  note collects every unfinished one across all sessions with a Dataview `TASK`
+  query. A 남은 일 written as a plain bullet never appears there.
 - `Learnings/` and `Projects/` notes are **merged, not replaced**: read, then
   append a dated entry or revise a stale line. Never clobber existing content.
+- **Link every Learning to its neighbours.** Whenever you create or extend a
+  topic note, put 2–3 wikilinks to *other* `Learnings/` notes under its
+  `## 관련`, and add the reverse link in each of those notes. Unlike
+  session↔decision links, this one is not optional bookkeeping: topic notes
+  were only ever linked *from* sessions, which left 41% of them isolated from
+  each other while the titles showed obvious clusters (five `Canton …` notes
+  with nothing between them). Sessions are the log; the Learnings graph is the
+  part that is still useful in a year, and it only exists if these links get
+  written. Link on a real relation — same subsystem, shared root cause, one
+  supersedes the other, one is the prerequisite for the other — and say which
+  in a few words:
+
+  ```markdown
+  ## 관련
+  - [[Canton Validator 온보딩 함정]] — 같은 온보딩 경로, 이쪽이 선행 조건
+  - [[Auth0 M2M 토큰 쿼터 소진]] — 같은 사고에서 같이 터졌다
+  - [[2026-07-30-CC-DevNet-LSU-장애]] · [[CC]]
+  ```
+
+  Do not manufacture a link to hit a count. A genuinely new subject with no
+  neighbour yet gets none, and picks them up when the second note arrives.
 - `Career/Achievements.md` is append-only. New bullets go under the current
-  month's heading.
+  month's heading. Append-only has no ceiling, so once it passes ~100 bullets,
+  split the previous year out to `Career/Achievements-<year>.md` and link it
+  from the top — `career-review` reads the whole `Career/` folder.
 - Write in the user's own language. If their prompts are in Korean, write the
   notes in Korean.
 - Be specific and quote the evidence. Reference actual file paths, error
@@ -173,8 +218,11 @@ On the very first pass in a vault, also create the entry point once:
 python3 "${CLAUDE_PLUGIN_ROOT}/scripts/journal_util.py" index
 ```
 
-`_raw/` is a queue, not an archive. If it has grown past a few hundred files,
-offer to retire the ones that have already become notes — they move out of the
+`_raw/` is a queue, not an archive. Digests are ~6KB each and Obsidian indexes
+every one of them into search, the graph, and the index note's Dataview queries,
+so a few thousand of them slow the vault down for no benefit. If `stats` shows
+`_raw_by_status.processed` past a few hundred, offer to retire the ones that
+have already become notes — they move out of the
 vault (reversibly) so Obsidian stops indexing them. Never run this unasked:
 
 ```bash

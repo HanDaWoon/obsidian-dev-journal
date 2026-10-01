@@ -43,6 +43,13 @@ def check(cond: bool, label: str) -> None:
         print(f"  FAIL  {label}")
 
 
+def load_util():
+    spec = importlib.util.spec_from_file_location("journal_util", UTIL)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
 def load_capture():
     spec = importlib.util.spec_from_file_location("capture_session", CAPTURE)
     mod = importlib.util.module_from_spec(spec)
@@ -141,6 +148,22 @@ def test_redaction(m) -> None:
         ("authentication: JWT 로 바꿨다", None),
         ("the secretary: bob", None),
         ("tokenizer: sentencepiece", None),
+        # Qualified names. The keyword is a namespace component or the head of
+        # a compound type, never the key being assigned. The vault carried
+        # `com.digitalasset.auth.TokenService: «redacted»`, where the masked
+        # word was the error message.
+        ("com.digitalasset.auth.TokenService: error message here", None),
+        ("org.springframework.security.AuthManager: init failed", None),
+        ("io.jsonwebtoken.JwtParser: malformed input", None),
+        ("com.acme.auth.TokenRefresher: retry scheduled", None),
+        ("secrets.json: no such file", None),          # bridge crosses a dot
+        # ...and the rejection must not open a hole. When the keyword *is* the
+        # whole last segment it still names the key, however deep the path.
+        ("vault.secrets.token = hunter2", "hunter2"),
+        ("a.b.c.d.password=hunter2", "hunter2"),
+        ("config.api_key = hunter2", "hunter2"),       # one segment deep
+        ("settings.token=hunter2", "hunter2"),
+        ('{"secretValue": "hunter2"}', "hunter2"),     # camelCase key, not dotted
     ]
     for text, leak in cases:
         got = m.redact(text)
@@ -1247,6 +1270,312 @@ def test_no_real_vault_writes(tmp: Path) -> None:
         check(True, "no real vault configured; nothing to protect")
 
 
+
+def test_frontmatter_safety(m, tmp: Path) -> None:
+    """Frontmatter values come from outside and must never break the block."""
+    print("\n[frontmatter quoting]")
+    check(m.yaml_str('my"repo') == '"my\\"repo"', "a double quote is escaped, not emitted raw")
+    check(m.yaml_str("a\\b") == '"a\\\\b"', "a backslash is escaped")
+    check("\n" not in m.yaml_str("l1\nl2"), "a newline cannot end the scalar early")
+    check(m.yaml_str(None) == '""', "None renders as an empty scalar, not 'None'")
+
+    # A checkout named my"repo produced `repo: "my"repo"`, after which every
+    # frontmatter reader — Obsidian, and journal_util's own frontmatter() —
+    # misread status and session_id, so dedupe and `pending` stopped seeing it.
+    work = tmp / 'fm' / 'my"repo'
+    work.mkdir(parents=True)
+    t = jsonl(tmp / "fm.jsonl", [
+        {"type": "user", "timestamp": ts(9), "cwd": str(work),
+         "message": {"role": "user", "content": "one"}},
+        {"type": "user", "timestamp": ts(8), "cwd": str(work),
+         "message": {"role": "user", "content": "two"}},
+    ])
+    out = run_capture("--transcript", str(t), "--force", "--stdout").stdout
+    fm = out.split("---")[1]
+    check('repo: "my\\"repo"' in fm, "a quote in the repo name is escaped in the digest")
+    check(fm.count("\nsession_id:") == 1, "the frontmatter block stays well-formed")
+
+    # journal_util must read back exactly what capture wrote.
+    home = tmp / "fmhome"
+    (home / ".claude").mkdir(parents=True)
+    d = tmp / "fmread"
+    d.mkdir()
+    (d / "x.md").write_text('---\nstatus: unprocessed\nrepo: "my\\"repo"\n---\nbody\n',
+                            encoding="utf-8")
+    util = load_util()
+    check(util.frontmatter(d / "x.md").get("repo") == 'my"repo',
+          "frontmatter() unescapes what yaml_str() escaped")
+
+
+def test_shell_failure_tail(tmp: Path) -> None:
+    """A failure signs itself at the END of a long log."""
+    print("\n[shell failure: tail of long output]")
+    # 37KB of passing lines followed by "3 failed, 1197 passed". The scanner
+    # used to read only the first 6000 chars, so the digest of a genuinely
+    # failing test run claimed errors_hit: 0 — the exact blind spot
+    # SHELL_FAILURE_RE was added to close.
+    long_log = "\n".join(f"tests/test_{i}.py::case ... ok" for i in range(1200))
+    t = jsonl(tmp / "tail.jsonl", [
+        {"type": "user", "timestamp": ts(9), "cwd": str(tmp),
+         "message": {"role": "user", "content": "run the suite"}},
+        {"type": "user", "timestamp": ts(8), "cwd": str(tmp),
+         "message": {"role": "user", "content": "fix it"}},
+        {"type": "assistant", "timestamp": ts(7), "cwd": str(tmp), "message": {
+            "role": "assistant", "model": "m",
+            "content": [{"type": "tool_use", "id": "b1", "name": "Bash",
+                         "input": {"command": "pytest -q"}}]}},
+        {"type": "user", "timestamp": ts(6), "cwd": str(tmp), "message": {
+            "role": "user",
+            "content": [{"type": "tool_result", "tool_use_id": "b1",
+                         "content": long_log + "\n3 failed, 1197 passed"}]}},
+    ])
+    out = run_capture("--transcript", str(t), "--force", "--stdout").stdout
+    check("errors_hit: 1" in out, "a failure in the tail of a 37KB log is detected")
+    check("_(inferred from output)_" in out, "it is marked inferred, not harness-reported")
+    check("3 failed" in out, "the quoted detail is the failure line, not the first 320 chars")
+
+    # ...and the head still works, so this is a widening, not a move.
+    t2 = jsonl(tmp / "head.jsonl", [
+        {"type": "user", "timestamp": ts(9), "cwd": str(tmp),
+         "message": {"role": "user", "content": "a"}},
+        {"type": "user", "timestamp": ts(8), "cwd": str(tmp),
+         "message": {"role": "user", "content": "b"}},
+        {"type": "assistant", "timestamp": ts(7), "cwd": str(tmp), "message": {
+            "role": "assistant", "model": "m",
+            "content": [{"type": "tool_use", "id": "b2", "name": "Bash",
+                         "input": {"command": "./deploy"}}]}},
+        {"type": "user", "timestamp": ts(6), "cwd": str(tmp), "message": {
+            "role": "user",
+            "content": [{"type": "tool_result", "tool_use_id": "b2",
+                         "content": "command not found\n" + long_log}]}},
+    ])
+    check("errors_hit: 1" in run_capture("--transcript", str(t2), "--force", "--stdout").stdout,
+          "a failure at the head of a long log is still detected")
+
+
+def test_config_robustness(m, tmp: Path) -> None:
+    """A hand-edited config must degrade, never take the capture down."""
+    print("\n[config robustness]")
+    cfg = m.coerce_config({"max_prompts": "40", "max_digest_chars": 5})
+    check(cfg["max_prompts"] == 40, "a numeric string is coerced to int")
+    check(cfg["max_digest_chars"] >= 500, "an unusably small budget is floored")
+    check(m.coerce_config({"max_files": None})["max_files"] == m.DEFAULTS["max_files"],
+          "a null falls back to the default")
+    check(m.coerce_config({"exclude_paths": "/a"})["exclude_paths"] == [],
+          "a stringly-typed exclude_paths is ignored rather than iterated per character")
+
+    # Before coercion, `2 > "40"` raised TypeError deep inside build_digest and
+    # the top-level guard swallowed it: the session vanished with one log line.
+    home = tmp / "cfghome"
+    (home / ".claude" / "obsidian-dev-journal").mkdir(parents=True)
+    (home / ".claude" / "obsidian-dev-journal" / "config.json").write_text(
+        json.dumps({"max_prompts": "40"}), encoding="utf-8")
+    t = jsonl(tmp / "cfg.jsonl", [
+        {"type": "user", "timestamp": ts(9), "cwd": str(tmp),
+         "message": {"role": "user", "content": "one"}},
+        {"type": "user", "timestamp": ts(8), "cwd": str(tmp),
+         "message": {"role": "user", "content": "two"}},
+    ])
+    out = run_capture("--transcript", str(t), "--force", "--stdout", home=home).stdout
+    check("type: dev-journal-raw" in out, "a stringly-typed limit still produces a digest")
+
+
+def test_exclude_path_expansion(tmp: Path) -> None:
+    """`~/private` in the config used to match nothing at all."""
+    print("\n[exclude_paths expansion]")
+    home = tmp / "exhome"
+    work = home / "client-private"
+    work.mkdir(parents=True)
+    (home / ".claude" / "obsidian-dev-journal").mkdir(parents=True)
+    (home / ".claude" / "obsidian-dev-journal" / "config.json").write_text(
+        json.dumps({"exclude_paths": ["~/client-private"]}), encoding="utf-8")
+    t = jsonl(tmp / "ex.jsonl", [
+        {"type": "user", "timestamp": ts(9), "cwd": str(work),
+         "message": {"role": "user", "content": "secret one"}},
+        {"type": "user", "timestamp": ts(8), "cwd": str(work),
+         "message": {"role": "user", "content": "secret two"}},
+    ])
+    r = run_capture("--transcript", str(t), "--force", "--stdout", home=home)
+    check("type: dev-journal-raw" not in r.stdout,
+          "a ~-relative exclude_paths entry actually excludes")
+    check("secret one" not in r.stdout, "no prompt from an excluded repo leaks")
+
+    # An absolute entry must keep working exactly as before.
+    (home / ".claude" / "obsidian-dev-journal" / "config.json").write_text(
+        json.dumps({"exclude_paths": [str(work)]}), encoding="utf-8")
+    r = run_capture("--transcript", str(t), "--force", "--stdout", home=home)
+    check("type: dev-journal-raw" not in r.stdout, "an absolute entry still excludes")
+
+
+def test_unwritable_vault_stages(tmp: Path) -> None:
+    """A vault that exists but cannot be written used to lose the session."""
+    print("\n[unwritable vault]")
+    home = tmp / "rohome"
+    (home / ".claude" / "obsidian-dev-journal").mkdir(parents=True)
+    vault = home / "V"
+    raw = vault / "DevJournal" / "_raw"
+    raw.mkdir(parents=True)
+    (home / ".claude" / "obsidian-dev-journal" / "config.json").write_text(
+        json.dumps({"vault_path": str(vault)}), encoding="utf-8")
+    t = jsonl(tmp / "ro.jsonl", [
+        {"type": "user", "timestamp": ts(9), "cwd": str(tmp),
+         "message": {"role": "user", "content": "one"}},
+        {"type": "user", "timestamp": ts(8), "cwd": str(tmp),
+         "message": {"role": "user", "content": "two"}},
+    ])
+    os.chmod(raw, 0o500)
+    try:
+        run_capture("--transcript", str(t), "--force", "--session-id", "roprobe", home=home)
+        staged = list((home / ".claude" / "obsidian-dev-journal" / "staged").glob("*.md"))
+        check(bool(staged), "the digest is staged instead of being lost")
+        check(not list(raw.glob("*")), "nothing half-written is left in the vault")
+    finally:
+        os.chmod(raw, 0o700)
+
+
+def test_pending_is_bounded(tmp: Path) -> None:
+    """`pending` is the skill's first call; its output goes straight to a model."""
+    print("\n[pending output is bounded]")
+    home = tmp / "bigqueue"
+    (home / ".claude").mkdir(parents=True)
+    vault = home / "V"
+    (vault / ".obsidian").mkdir(parents=True)
+    run_util("init", "--vault", str(vault), home=home)
+    raw = vault / "DevJournal" / "_raw"
+    for i in range(120):
+        (raw / f"2026-01-{i % 28 + 1:02d}--repo--{i:08d}.md").write_text(
+            '---\nstatus: unprocessed\nsession_id: "s%08d"\nrepo: "repo"\n'
+            'started: "2026-01-%02d"\nturns: 3\n---\n%s\n' % (i, i % 28 + 1, "x" * 4000),
+            encoding="utf-8")
+    out = json.loads(run_util("pending", home=home).stdout)
+    # 1667 unprocessed digests rendered 634KB of JSON — ~160k tokens spent
+    # before a single note was written, on exactly the backlog this clears.
+    check(out["count"] == 120, "count still reports the true total")
+    check(out["returned"] <= 40, "the default page is bounded")
+    check(out["truncated"] is True, "the caller is told the list was cut")
+    check(out["digests"][0]["started"] <= out["digests"][-1]["started"],
+          "the bounded page is the oldest digests, not an arbitrary slice")
+    everything = json.loads(run_util("pending", "--limit", "0", home=home).stdout)
+    check(everything["returned"] == 120, "--limit 0 still returns everything for scripting")
+
+
+def test_pending_exposes_skill_fields(tmp: Path) -> None:
+    """The skill has rules keyed on `part` and `repo_name_guessed`."""
+    print("\n[pending exposes part / guessed]")
+    home = tmp / "pf"
+    (home / ".claude").mkdir(parents=True)
+    vault = home / "V"
+    (vault / ".obsidian").mkdir(parents=True)
+    run_util("init", "--vault", str(vault), home=home)
+    raw = vault / "DevJournal" / "_raw"
+    (raw / "a.md").write_text(
+        '---\nstatus: unprocessed\nsession_id: "a"\npart: 2\n'
+        'repo_name_guessed: true\nstarted: "2026-01-01"\n---\n', encoding="utf-8")
+    (raw / "b.md").write_text(
+        '---\nstatus: unprocessed\nsession_id: "b"\n'
+        'repo_name_guessed: false\nstarted: "2026-01-02"\n---\n', encoding="utf-8")
+    items = {i["path"].rsplit("/", 1)[-1]: i
+             for i in json.loads(run_util("pending", home=home).stdout)["digests"]}
+    check(items["a.md"]["part"] == 2, "a part digest is flagged without opening the file")
+    check(items["a.md"]["repo_name_guessed"] is True, "a guessed repo name is flagged")
+    check(items["b.md"]["part"] == 0, "a normal digest reports part 0")
+    check(items["b.md"]["repo_name_guessed"] is False, "a resolved repo is not flagged")
+
+
+def test_backfill_unknown_cwd(tmp: Path) -> None:
+    """A cwd-less transcript must not be filed under the user's home repo."""
+    print("\n[backfill: unknown cwd]")
+    # The fallback was str(Path.home()). A home directory under dotfiles
+    # management is a git repo, so every transcript without a cwd claimed the
+    # user's home as its repository.
+    home = tmp / "bfhome"
+    (home / ".claude" / "projects" / "p").mkdir(parents=True)
+    vault = home / "V"
+    (vault / ".obsidian").mkdir(parents=True)
+    run_util("init", "--vault", str(vault), home=home)
+    jsonl(home / ".claude" / "projects" / "p" / "nocwd.jsonl", [
+        {"type": "user", "timestamp": ts(9), "message": {"role": "user", "content": "one"}},
+        {"type": "user", "timestamp": ts(8), "message": {"role": "user", "content": "two"}},
+    ])
+    run_util("backfill", "--limit", "5", home=home)
+    digests = list((vault / "DevJournal" / "_raw").glob("*.md"))
+    check(bool(digests), "a cwd-less transcript is still digested")
+    text = digests[0].read_text(encoding="utf-8")
+    check('repo: "unknown"' in text, "it is filed as 'unknown', not as the home directory")
+    check(str(home.name) not in text.split("---")[1], "the home directory name is not claimed as a repo")
+
+
+def test_doctor_flags_config_mistakes(tmp: Path) -> None:
+    """Config mistakes degrade capture silently; doctor is where they surface."""
+    print("\n[doctor: config problems]")
+    home = tmp / "dch"
+    (home / ".claude" / "obsidian-dev-journal").mkdir(parents=True)
+    (home / ".claude" / "obsidian-dev-journal" / "config.json").write_text(
+        json.dumps({"extra_commands": "(unclosed", "max_prompts": "40",
+                    "exclude_paths": ["~/private"]}), encoding="utf-8")
+    rep = json.loads(run_util("doctor", home=home).stdout)
+    problems = " ".join(rep["config_problems"])
+    check("extra_commands" in problems, "an invalid extra_commands regex is reported")
+    check("max_prompts" in problems, "a stringly-typed limit is reported")
+    check(rep["exclude_paths"][0]["expands_to"].startswith(str(home)),
+          "exclude_paths shows what each entry actually expands to")
+
+
+
+def test_topics_map(tmp: Path) -> None:
+    """Topic notes were only linked *from* sessions, so they never met."""
+    print("\n[topics map]")
+    home = tmp / "tp"
+    (home / ".claude").mkdir(parents=True)
+    vault = home / "V"
+    (vault / ".obsidian").mkdir(parents=True)
+    run_util("init", "--vault", str(vault), home=home)
+    learn = vault / "DevJournal" / "Learnings"
+
+    (learn / "Canton LSU.md").write_text(
+        "---\ntype: learning\ntags: [learning, canton]\nlast_updated: 2026-07-30\n"
+        "confidence: solid\n---\n\n# Canton LSU\n\n## 핵심\n"
+        "topology freeze 는 topology 트랜잭션만 멈춘다.\n\n"
+        "## 관련\n- [[Canton 온보딩]] — 같은 경로\n- [[2026-07-30-sess]]\n",
+        encoding="utf-8")
+    (learn / "Canton 온보딩.md").write_text(
+        "---\ntype: learning\ntags: [learning, canton]\nlast_updated: 2026-07-29\n"
+        "confidence: shaky\n---\n\n# Canton 온보딩\n\n## 핵심\n"
+        "**온보딩**은 `party` 생성이 먼저다.\n",
+        encoding="utf-8")
+    (learn / "Redis 원자성.md").write_text(
+        "---\ntype: learning\ntags: [learning, redis]\nlast_updated: 2026-08-01\n---\n\n"
+        "# Redis 원자성\n\n## 핵심\nINCR + EXPIRE 는 원자적이 아니다.\n",
+        encoding="utf-8")
+
+    out = json.loads(run_util("topics", home=home).stdout)
+    by = {t["name"]: t for t in out["topics"]}
+    check(out["count"] == 3, "every topic note is listed")
+    # Linking needs to know what a note *says*; reading 41 files to place one
+    # link is not affordable, so the gist comes back with the name.
+    check(by["Canton LSU"]["gist"].startswith("topology freeze"),
+          "the ## 핵심 line is extracted as the gist")
+    check("**" not in by["Canton 온보딩"]["gist"] and "`" not in by["Canton 온보딩"]["gist"],
+          "the gist is stripped of markdown emphasis")
+    check(by["Canton LSU"]["links_to"] == ["Canton 온보딩"],
+          "only Learning→Learning links count; the session link is ignored")
+    check(by["Canton 온보딩"]["linked_from"] == ["Canton LSU"], "the reverse edge is reported")
+    check(out["isolated"] == ["Redis 원자성"] and out["isolated_count"] == 1,
+          "a topic no other topic reaches is called out")
+    check(by["Canton 온보딩"]["confidence"] == "shaky", "frontmatter fields come along")
+
+    filtered = json.loads(run_util("topics", "--query", "redis", home=home).stdout)
+    check([t["name"] for t in filtered["topics"]] == ["Redis 원자성"],
+          "--query narrows the map so the whole vault need not be loaded")
+    check(filtered["count"] == 1 and filtered["isolated_count"] == 1,
+          "counts describe the filtered view")
+    tagged = json.loads(run_util("topics", "--query", "canton", home=home).stdout)
+    check(len(tagged["topics"]) == 2, "--query matches tags, not just names")
+    bounded = json.loads(run_util("topics", "--limit", "1", home=home).stdout)
+    check(bounded["returned"] == 1 and bounded["truncated"] is True,
+          "the map is bounded like pending, for the same context reason")
+
+
 def main() -> int:
     global SCRATCH_HOME
     m = load_capture()
@@ -1270,6 +1599,16 @@ def main() -> int:
         test_doctor_sees_every_copy(tmp)
         test_init_migration_resilience(tmp)
         test_host_field(m, tmp)
+        test_frontmatter_safety(m, tmp)
+        test_shell_failure_tail(tmp)
+        test_config_robustness(m, tmp)
+        test_exclude_path_expansion(tmp)
+        test_unwritable_vault_stages(tmp)
+        test_pending_is_bounded(tmp)
+        test_pending_exposes_skill_fields(tmp)
+        test_backfill_unknown_cwd(tmp)
+        test_doctor_flags_config_mistakes(tmp)
+        test_topics_map(tmp)
         test_perf(tmp)
 
     print(f"\n{PASSES} passed, {len(FAILURES)} failed")

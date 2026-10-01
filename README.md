@@ -83,6 +83,14 @@ Sessions · Decisions · Learnings · Projects · Career 노트
 └── Career/        Achievements.md — append-only 성과 원재료
 ```
 
+`Learnings`는 서로 링크한다. 주제 노트를 새로 쓰거나 덧붙일 때 관련된 다른
+`Learnings/` 노트 2~3개를 `## 관련`에 걸고 저쪽에도 역방향으로 건다. 이게 없으면
+주제 노트가 세션에서 들어오기만 하는 잎이 되어 서로 고립된다(실측 41개 중 17개).
+Sessions는 로그고, **1년 뒤에도 쓸모 있는 건 Learnings 그래프**인데 그 그래프는
+이 링크가 있어야 존재한다. 어떤 노트가 있는지는 `journal_util.py topics --query
+<주제>` 로 본다 — 이름·`## 핵심` 한 줄·태그·이미 걸린 이웃을 돌려주므로 수십 개를
+다 읽지 않아도 된다.
+
 `Decisions`는 아무 선택이나 기록하지 않는다. **살아있는 대안이 있었고 다른
 코드베이스로 이어졌을 갈림길**만 남긴다. 그 기준이 없으면 볼트가 쓰레기장이
 된다. `Learnings`도 같다 — 다음 달에도 참인 것만.
@@ -155,7 +163,7 @@ python3 $S/journal_util.py backfill --limit 0              # 전부
 | `host_name` | `""` | 다이제스트에 남길 머신 이름. 비우면 호스트네임의 첫 라벨(`mbp.local` → `mbp`) |
 | `min_user_prompts` | `2` | 이보다 짧은 세션은 건너뛴다 |
 | `min_files_touched` | `0` | 프롬프트가 적어도 이만큼 파일을 고쳤으면 기록한다. **하한이 아니라 추가 통과 조건**이고, 최소 1로 바닥이 잡힌다 |
-| `exclude_paths` | `[]` | 이 경로 아래 작업은 절대 기록하지 않는다 |
+| `exclude_paths` | `[]` | 이 경로 아래 작업은 절대 기록하지 않는다. cwd 부분 문자열 매칭, `~`·`$VAR` 확장됨 |
 | `redact` | `true` | 명령/프롬프트에서 시크릿 패턴 마스킹 |
 | `extra_commands` | `""` | 기록할 명령 목록을 넓히는 정규식. 도메인 도구용 (`\b(daml\|sui\|vast)\b`) |
 | `max_prompts` / `max_commands` / `max_digest_chars` | 40 / 40 / 14000 | 다이제스트 크기 상한 |
@@ -165,12 +173,38 @@ python3 $S/journal_util.py backfill --limit 0              # 전부
 서브에이전트 → 명령 → 프롬프트 → recap → 계획 → 파일 → 에러 → 질문). 커밋 목록은
 깎지 않는다.
 
+## 세션이 쌓이면
+
+측정치(디지스트 5000개, 30MB 기준):
+
+| 동작 | 시간 |
+| --- | --- |
+| 세션 종료 캡처 (5000개 디렉터리에 쓰기) | 0.24s |
+| `pending` / `stats` / `doctor` / `prune` | 각 0.3~0.4s |
+| 10MB transcript 파싱 | 0.5s |
+
+스크립트 쪽은 선형이고 상수가 작아서 문제되지 않는다. 실제 병목은 두 군데였다:
+
+- **`pending` 출력 크기.** 미처리 1667건이면 JSON 634KB(≈16만 토큰)라 스킬
+  1단계에서 컨텍스트가 터진다. 이제 기본 40건만 돌려주고 `count` 로 총계를,
+  `truncated` 로 잘렸음을 알린다. 전량이 필요하면 `--limit 0`.
+- **Obsidian 자체.** `_raw/` 는 다이제스트당 ~6KB 이고 Obsidian 이 전부 검색·
+  그래프·Dataview 에 색인한다. 이게 `prune` 이 있는 이유다 — 합성이 끝난 것은
+  볼트 밖 archive 로 (되돌릴 수 있게) 옮긴다. 인덱스 노트의 쿼리에도 전부
+  `LIMIT` 이 걸려 있다.
+- `Career/Achievements.md` 는 append-only 라 상한이 없다. 100불릿쯤에서
+  `Achievements-<연도>.md` 로 분리한다(`career-review` 는 `Career/` 폴더 전체를 읽는다).
+
 ## 알아둘 것
 
 - **프라이버시**: 다이제스트에는 프롬프트 원문, 파일 경로, 명령줄이 평문으로
   들어간다. 볼트가 외부로 동기화된다면 민감한 레포는 `exclude_paths`에 넣는다.
-  `redact`는 `KEY=`, `Bearer`, `sk-…`, DB URL 자격증명 같은 흔한 패턴을 가리지만
-  **보장이 아니다**.
+  `~/work/private` 처럼 `~` 를 써도 되고, `doctor` 가 각 항목이 실제로 무엇으로
+  풀리는지 보여준다. `redact`는 `KEY=`, `Bearer`, `sk-…`, DB URL 자격증명 같은
+  흔한 패턴을 가리지만 **보장이 아니다**.
+- **볼트에 못 쓰면 잃지 않고 staging 한다.** 외장 드라이브가 빠졌거나 동기화
+  클라이언트가 폴더를 잠갔을 때 다이제스트는 `~/.claude/obsidian-dev-journal/staged/`
+  로 간다. `init` 을 다시 돌리면 볼트로 옮겨온다.
 - **transcript 포맷은 내부 규격**이다. Claude Code 업데이트로 바뀔 수 있다.
   파서는 모든 필드를 방어적으로 읽어서, 포맷이 바뀌면 크래시가 아니라 "덜 자세한
   다이제스트"로 degrade하고 상단에 경고를 붙인다. 경고가 보이면
@@ -183,7 +217,7 @@ python3 $S/journal_util.py backfill --limit 0              # 전부
 ## 개발
 
 ```bash
-python3 tests/test_capture.py     # 회귀 스위트 168건, 의존성 없음
+python3 tests/test_capture.py     # 회귀 스위트 259건, 의존성 없음
 ```
 
 설계 근거와 깨면 안 되는 제약은 `CLAUDE.md`에 있다. 코드를 고치기 전에 읽는다.
@@ -201,6 +235,7 @@ python3 $S/journal_util.py unhold <f>                # 다시 큐로
 python3 $S/journal_util.py index                     # 볼트 인덱스 노트 생성
 python3 $S/journal_util.py prune --older-than 90 --dry-run   # 합성 끝난 다이제스트 정리
 python3 $S/journal_util.py backfill --limit 20       # 과거 세션 소급
+python3 $S/journal_util.py topics --query canton     # 주제 노트 지도 (링크용)
 python3 $S/journal_util.py stats                     # 현황
 
 # 볼트를 건드리지 않고 파서 출력만 보기

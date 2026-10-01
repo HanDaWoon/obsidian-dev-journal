@@ -1,7 +1,7 @@
 {
   "name": "obsidian-dev-journal",
   "displayName": "Obsidian Dev Journal",
-  "version": "0.5.0",
+  "version": "0.6.0",
   "description": "Captures every Claude Code session into your Obsidian vault: decision logs, learnings, codebase knowledge, and resume-ready achievement bullets. Zero-token capture via a SessionEnd hook, batched LLM synthesis on demand.",
   "author": {
     "name": "HanDaWoon"

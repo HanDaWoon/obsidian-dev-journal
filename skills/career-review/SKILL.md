@@ -32,7 +32,9 @@ python3 "${CLAUDE_PLUGIN_ROOT}/scripts/journal_util.py" stats
 
 Then read, in this order:
 
-1. `Career/Achievements.md` — the primary source
+1. `Career/Achievements*.md` — the primary source. It rolls over by year once
+   it grows past ~100 bullets, so read the whole `Career/` folder, not just
+   `Achievements.md`, or an older period comes back empty
 2. `Decisions/` in range — evidence of judgment and scope
 3. `Projects/` — breadth of systems owned
 4. `Learnings/` — trajectory and depth

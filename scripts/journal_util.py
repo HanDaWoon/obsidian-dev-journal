@@ -14,6 +14,7 @@ Keeps the LLM's job small: one call to find work, one call to close it out.
     journal_util.py index                  # (re)write the vault's index note
     journal_util.py prune [--older-than N] # archive processed digests out of the vault
     journal_util.py backfill [--limit N]   # digest past sessions from ~/.claude/projects
+    journal_util.py topics [--query S]     # topic notes + how they interlink
     journal_util.py stats                  # what's in the journal so far
 """
 
@@ -59,6 +60,19 @@ def raw_dirs(cfg: dict) -> list[Path]:
     return [d for d in dirs if d.is_dir()]
 
 
+def unquote_scalar(raw: str) -> str:
+    """Undo capture_session.yaml_str() for a single frontmatter value.
+
+    A blind .strip('"') left the backslashes in, so a repo named `my"repo`
+    came back as `my\\"repo` and no longer matched itself anywhere.
+    """
+    value = raw.strip()
+    if len(value) >= 2 and value[0] == '"' and value[-1] == '"':
+        value = value[1:-1]
+        return re.sub(r'\\(["\\])', r"\1", value)
+    return value.strip('"')
+
+
 def frontmatter(path: Path) -> dict:
     meta: dict[str, str] = {}
     try:
@@ -70,7 +84,7 @@ def frontmatter(path: Path) -> dict:
                     break
                 m = re.match(r"^([A-Za-z_][A-Za-z0-9_]*):\s*(.*)$", line)
                 if m:
-                    meta[m.group(1)] = m.group(2).strip().strip('"')
+                    meta[m.group(1)] = unquote_scalar(m.group(2))
     except Exception:
         pass
     return meta
@@ -291,6 +305,45 @@ def find_plugin_installs() -> list[dict]:
     return hits
 
 
+NUMERIC_KEYS = (
+    "min_user_prompts", "min_files_touched", "max_prompts", "max_prompt_chars",
+    "max_commands", "max_files", "max_errors", "max_recaps", "max_recap_chars",
+    "max_digest_chars",
+)
+
+
+def config_problems(cfg: dict) -> list:
+    """Config mistakes that silently degrade capture instead of failing loudly.
+
+    All three below produce a *worse digest*, never an error the user sees:
+    a bad `extra_commands` regex falls back to the built-in allowlist, a
+    stringly-typed limit falls back to the default, and an `exclude_paths`
+    entry that resolves to nothing means a repo the user believes is excluded
+    is being journalled in full.
+    """
+    problems = []
+    extra = (cfg.get("extra_commands") or "").strip()
+    if extra:
+        try:
+            re.compile(extra)
+        except re.error as exc:
+            problems.append(f"extra_commands is not a valid regex ({exc}); "
+                            "capture falls back to the built-in command list")
+    for key in NUMERIC_KEYS:
+        if key in cfg and not isinstance(cfg[key], int):
+            problems.append(f"{key} should be a number, not {type(cfg[key]).__name__} "
+                            f"({cfg[key]!r}); capture falls back to the default")
+    raw_excludes = cfg.get("exclude_paths")
+    if raw_excludes is not None and not isinstance(raw_excludes, list):
+        problems.append("exclude_paths must be a list; it is being ignored, so "
+                        "nothing is excluded")
+    elif raw_excludes:
+        for entry in raw_excludes:
+            if not isinstance(entry, str) or not entry.strip():
+                problems.append(f"exclude_paths entry {entry!r} is not a usable path")
+    return problems
+
+
 def cmd_doctor(_args) -> int:
     cfg = load_config()
     base = base_dir(cfg)
@@ -349,6 +402,15 @@ def cmd_doctor(_args) -> int:
             if stale
             else None
         ),
+        # A path is matched as a substring of the session's cwd, both verbatim
+        # and with ~/$VARS expanded — showing the expansion is the only way to
+        # tell "excluded" from "silently not excluded".
+        "exclude_paths": [
+            {"entry": e, "expands_to": os.path.expanduser(os.path.expandvars(e))}
+            for e in (cfg.get("exclude_paths") or [])
+            if isinstance(e, str) and e.strip()
+        ],
+        "config_problems": config_problems(cfg),
         "last_capture_log_line": last_capture,
         "stale_pending_payloads": orphans,
         "python": sys.version.split()[0],
@@ -378,6 +440,12 @@ def cmd_pending(args) -> int:
                 {
                     "path": str(f),
                     "repo": meta.get("repo", ""),
+                    # The skill has explicit rules keyed on these two, and no
+                    # way to see them without opening every file first: `part`
+                    # means "extend the existing note, do not write a new one",
+                    # and a guessed repo must not spawn a Projects/ note.
+                    "part": int(meta["part"]) if meta.get("part", "").isdigit() else 0,
+                    "repo_name_guessed": meta.get("repo_name_guessed", "") == "true",
                     "host": meta.get("host", ""),
                     "started": meta.get("started", ""),
                     "duration": meta.get("duration", ""),
@@ -389,6 +457,13 @@ def cmd_pending(args) -> int:
             )
     items.sort(key=lambda i: i["started"])
     total = len(items)
+    # Bounded by default. The dev-journal skill calls this as its first step and
+    # feeds the JSON straight into the model: at 1667 unprocessed digests the
+    # unbounded output was 634KB (~160k tokens) — enough to blow the context
+    # window open before a single note got written, on exactly the backlog the
+    # skill exists to clear. `count` still reports the true total, and the list
+    # is oldest-first, so a bounded page is the batch you actually want.
+    # `--limit 0` restores the full dump for scripting.
     if args.limit:
         items = items[: args.limit]
     # A fixed batch of 8 means 17 passes on a 130-digest backlog. Scale the
@@ -400,6 +475,7 @@ def cmd_pending(args) -> int:
             {
                 "count": total,
                 "returned": len(items),
+                "truncated": total > len(items),
                 "held": held,
                 "suggested_batch": min(suggested, total) or 0,
                 "digests": items,
@@ -594,8 +670,12 @@ def cmd_backfill(args) -> int:
                 str(f),
                 "--session-id",
                 f.stem,
+                # Empty, never $HOME: a home directory under dotfiles
+                # management is itself a git repo, so falling back to it filed
+                # every cwd-less transcript under the user's home as its repo.
+                # "" resolves to repo "unknown" with an honest reason.
                 "--cwd",
-                cwd or str(Path.home()),
+                cwd,
             ],
             capture_output=True,
             text=True,
@@ -629,12 +709,34 @@ def cmd_backfill(args) -> int:
     return 0
 
 
-INDEX_NOTE = """# Dev Journal
+INDEX_NOTE = """---
+type: dev-journal-index
+tags: [dev-journal]
+---
 
-> `obsidian-dev-journal` 이 관리하는 볼트의 진입점. Dataview 플러그인이 필요하다.
-> 이 파일은 `journal_util.py index` 로 다시 만들 수 있다.
+# Dev Journal
+
+> [!info] 이 노트에 대해
+> `obsidian-dev-journal` 이 관리하는 볼트의 진입점. `journal_util.py index --force`
+> 로 다시 만들 수 있다.
+>
+> 아래 표는 **Dataview 플러그인**이 있을 때만 렌더링된다. 노트 자체는 평범한
+> 마크다운 + YAML 프론트매터라 Dataview 에 묶여 있지 않다 — 플러그인을 지우거나
+> Bases 같은 다른 쿼리 도구로 갈아타도 데이터는 그대로다. 플러그인 없이 쓰려면
+> 아래 「플러그인 없이 둘러보기」의 태그 링크를 쓰면 된다.
+
+## 남은 일 (모든 세션 통합)
+
+```dataview
+TASK
+FROM #dev-journal AND "{base}/Sessions"
+WHERE !completed
+GROUP BY repo
+LIMIT 50
+```
 
 ## 최근 세션
+
 ```dataview
 TABLE repo, duration, date
 FROM #dev-journal AND "{base}/Sessions"
@@ -643,13 +745,16 @@ LIMIT 25
 ```
 
 ## 결정 로그
+
 ```dataview
 TABLE repo, status, date
 FROM #decision
 SORT date DESC
+LIMIT 50
 ```
 
 ## 프로젝트
+
 ```dataview
 TABLE repo, sessions, last_updated
 FROM #project
@@ -657,14 +762,33 @@ SORT last_updated DESC
 ```
 
 ## 흔들리는 지식 (복습 필요)
+
 ```dataview
 LIST
 FROM #learning
 WHERE confidence = "shaky"
 SORT last_updated ASC
+LIMIT 30
+```
+
+## 이웃 없는 학습 (연결 필요)
+
+> [!tip]
+> 주제 노트는 세션에서 들어오기만 하면 서로 고립된다. 위 표는 링크 **개수**만
+> 세므로(세션·프로젝트 링크도 포함) 후보를 눈에 띄게 해줄 뿐이다. 정확한 답은
+> `journal_util.py topics` 의 `isolated` — 다른 **주제 노트**가 아무도 닿지 않는
+> 노트만 골라준다. 다음 `/dev-journal` 때 관련 노트에 양방향 링크를 걸면 그래프가
+> 주제 클러스터로 자란다.
+
+```dataview
+TABLE length(file.outlinks) AS 나가는링크, length(file.inlinks) AS 들어오는링크
+FROM #learning
+SORT length(file.outlinks) ASC
+LIMIT 25
 ```
 
 ## 최근 갱신된 학습
+
 ```dataview
 TABLE last_updated, confidence
 FROM #learning
@@ -673,18 +797,37 @@ LIMIT 15
 ```
 
 ## 처리 대기 중인 다이제스트
+
+> [!tip]
+> 이 목록이 길어지면 `/dev-journal` 을 돌린다. 합성이 끝난 다이제스트는
+> `journal_util.py prune` 으로 볼트 밖으로 물릴 수 있다 — `_raw/` 는 큐지
+> 보관소가 아니고, 수천 개가 쌓이면 검색·그래프·이 쿼리가 전부 느려진다.
+
 ```dataview
 LIST
 FROM "{base}/_raw"
 WHERE status = "unprocessed"
+SORT file.name ASC
+LIMIT 50
 ```
 
 ## 보류한 다이제스트
+
 ```dataview
 TABLE hold_reason, held
 FROM "{base}/_raw"
 WHERE status = "held"
+LIMIT 50
 ```
+
+## 플러그인 없이 둘러보기
+
+태그는 Obsidian 기본 기능이라 클릭하면 바로 검색이 열린다.
+
+- #session · #decision · #learning · #project — 종류별 전체
+- 폴더: `{base}/Sessions` · `{base}/Decisions` · `{base}/Learnings` ·
+  `{base}/Projects` · `{base}/Career`
+- 그래프 뷰에서 `path:{base}/_raw` 를 제외하면 지식 노트만 남는다
 """
 
 
@@ -807,6 +950,115 @@ def cmd_prune(args) -> int:
     return 0
 
 
+WIKILINK_RE = re.compile(r"\[\[([^\]|#]+)")
+
+
+def note_gist(text: str) -> str:
+    """The one line that says what a topic note is about.
+
+    Prefers the `## 핵심` / `## Core` summary the template asks for, because
+    that is written to be readable on its own; falls back to the first ordinary
+    line of prose so a hand-made note still shows up with something.
+    """
+    body = re.sub(r"\A---\n.*?\n---\n", "", text, flags=re.S)
+    m = re.search(r"^##\s*(?:핵심|Core|요약|Summary)\s*$(.*?)(?=^##\s|\Z)", body, re.S | re.M)
+    chunk = m.group(1) if m else body
+    for line in chunk.splitlines():
+        line = line.strip()
+        if line and not line.startswith(("#", "```", ">", "|", "---")):
+            line = re.sub(r"\*\*|`|\[\[|\]\]", "", line)
+            return line[:160]
+    return ""
+
+
+def cmd_topics(args) -> int:
+    """A compact map of the Learnings notes, for linking them to each other.
+
+    Learnings are the vault's knowledge layer, but they were only ever linked
+    *from* sessions: on the real vault 22 Learning→Learning links across 41
+    notes left 17 of them (41%) isolated in the topic graph, while the titles
+    showed obvious clusters — five `Canton …` notes with nothing between them.
+    Linking them turns a flat list into a subject map, which is the thing that
+    makes the graph view and the backlink pane worth opening.
+
+    Doing that well needs to know what each existing note *says*, and reading
+    41 files to place one link is not affordable. This returns name + gist +
+    tags + current neighbours in one call, which is enough to pick the right
+    two or three.
+    """
+    cfg = load_config()
+    base = base_dir(cfg)
+    if not base:
+        print(json.dumps({"ok": False, "error": "vault not configured; run init"}))
+        return 1
+    folder = base / (args.folder or "Learnings")
+    if not folder.is_dir():
+        print(json.dumps({"ok": False, "error": "no such folder: " + str(folder)}))
+        return 1
+
+    notes = {}
+    for f in sorted(folder.glob("*.md")):
+        try:
+            notes[f.stem] = (f, f.read_text(encoding="utf-8", errors="replace"))
+        except OSError:
+            continue
+
+    rows = []
+    linked_from: dict[str, list] = {n: [] for n in notes}
+    links_to: dict[str, list] = {}
+    for stem, (_f, text) in notes.items():
+        peers = []
+        for raw in WIKILINK_RE.findall(text):
+            target = raw.strip().split("/")[-1]
+            if target in notes and target != stem and target not in peers:
+                peers.append(target)
+        links_to[stem] = peers
+        for t in peers:
+            linked_from[t].append(stem)
+
+    needle = (args.query or "").lower()
+    for stem, (f, text) in notes.items():
+        meta = frontmatter(f)
+        gist = note_gist(text)
+        if needle and needle not in (stem + " " + gist + " " + meta.get("tags", "")).lower():
+            continue
+        rows.append(
+            {
+                "name": stem,
+                "path": str(f),
+                "gist": gist,
+                "tags": meta.get("tags", ""),
+                "confidence": meta.get("confidence", ""),
+                "last_updated": meta.get("last_updated", ""),
+                "links_to": links_to[stem],
+                "linked_from": sorted(linked_from[stem]),
+            }
+        )
+    rows.sort(key=lambda r: r["last_updated"], reverse=True)
+    total = len(rows)
+    isolated = [r["name"] for r in rows if not r["links_to"] and not r["linked_from"]]
+    if args.limit:
+        rows = rows[: args.limit]
+    print(
+        json.dumps(
+            {
+                "folder": str(folder),
+                "count": total,
+                "returned": len(rows),
+                "truncated": total > len(rows),
+                "isolated_count": len(isolated),
+                "isolated": isolated[:40],
+                "topics": rows,
+                "hint": "Link a new or extended topic note to 2-3 of these under "
+                        "'## 관련', and add the reverse link in each of those notes.",
+            },
+            indent=2,
+            ensure_ascii=False,
+        )
+    )
+    return 0
+
+
 def cmd_stats(_args) -> int:
     cfg = load_config()
     base = base_dir(cfg)
@@ -850,7 +1102,8 @@ def main() -> int:
     p = sub.add_parser("doctor"); p.set_defaults(fn=cmd_doctor)
 
     p = sub.add_parser("pending")
-    p.add_argument("--limit", type=int, default=0)
+    p.add_argument("--limit", type=int, default=40,
+                   help="digests to list, oldest first (0 = all; `count` is always the true total)")
     p.set_defaults(fn=cmd_pending)
 
     p = sub.add_parser("cat")
@@ -888,6 +1141,12 @@ def main() -> int:
     p.add_argument("--delete", action="store_true", help="delete instead of archiving")
     p.add_argument("--dry-run", action="store_true")
     p.set_defaults(fn=cmd_prune)
+
+    p = sub.add_parser("topics", help="map the topic notes so they can be linked to each other")
+    p.add_argument("--folder", default="Learnings", help="topic folder (default Learnings)")
+    p.add_argument("--query", default="", help="substring filter on name, gist or tags")
+    p.add_argument("--limit", type=int, default=60, help="0 = all")
+    p.set_defaults(fn=cmd_topics)
 
     p = sub.add_parser("stats"); p.set_defaults(fn=cmd_stats)
 

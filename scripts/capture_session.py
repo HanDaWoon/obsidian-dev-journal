@@ -189,7 +189,65 @@ def load_config() -> dict:
     env_vault = os.environ.get("OBSIDIAN_VAULT")
     if not cfg.get("vault_path") and env_vault:
         cfg["vault_path"] = env_vault
+    return coerce_config(cfg)
+
+
+# Numeric knobs, with the smallest value that still produces a usable digest.
+# The config is hand-edited JSON, so `"max_prompts": "40"` is an easy typo — and
+# every one of these is later used in a comparison or a slice, where a string
+# raises TypeError deep inside build_digest(). The top-level guard then swallows
+# it and the session is lost with one cryptic log line.
+INT_LIMITS = {
+    "min_user_prompts": 0,
+    "min_files_touched": 0,
+    "max_prompts": 1,
+    "max_prompt_chars": 40,
+    "max_commands": 0,
+    "max_files": 0,
+    "max_errors": 0,
+    "max_recaps": 0,
+    "max_recap_chars": 40,
+    "max_digest_chars": 500,
+}
+
+
+def coerce_config(cfg: dict) -> dict:
+    """Force the numeric knobs to sane ints and the list knobs to lists."""
+    for key, floor in INT_LIMITS.items():
+        try:
+            value = int(cfg.get(key, DEFAULTS[key]))
+        except (TypeError, ValueError):
+            log(f"config '{key}' is not a number ({cfg.get(key)!r}); using {DEFAULTS[key]}")
+            value = int(DEFAULTS[key])
+        if value < floor:
+            log(f"config '{key}' = {value} is below the usable minimum; using {floor}")
+            value = floor
+        cfg[key] = value
+    if not isinstance(cfg.get("exclude_paths"), list):
+        if cfg.get("exclude_paths"):
+            log("config 'exclude_paths' is not a list; ignoring it")
+        cfg["exclude_paths"] = []
     return cfg
+
+
+def excluded_matches(cfg: dict, cwd: str) -> str:
+    """The exclude_paths entry that vetoes this cwd, or "".
+
+    Entries are matched both verbatim and with `~`/`$VAR` expanded. The config
+    is written by hand, so `~/work/client-private` is the natural thing to type
+    — and it never matched anything, because a transcript's cwd is always
+    absolute. A privacy switch that quietly does nothing is worse than not
+    having one at all.
+    """
+    if not cwd:
+        return ""
+    for raw in cfg.get("exclude_paths") or []:
+        if not raw or not isinstance(raw, str):
+            continue
+        for form in {raw, os.path.expanduser(os.path.expandvars(raw))}:
+            if form and form in cwd:
+                return raw
+    return ""
 
 
 def command_matcher(cfg: dict) -> "re.Pattern":
@@ -216,7 +274,33 @@ def truncate(text: str, limit: int) -> str:
 
 
 def one_line(text: str, limit: int) -> str:
-    return truncate(re.sub(r"\s+", " ", text or ""), limit)
+    text = text or ""
+    # Collapse only what can still survive the limit. Whitespace collapsing
+    # never *grows* a string, so a generous slice is equivalent — and it keeps
+    # this O(limit) instead of O(size of the tool output). A single tool_result
+    # can carry megabytes; running the regex over all of it, only to keep the
+    # first few hundred characters, cost seconds per big transcript.
+    cap = max(limit, 1) * 32
+    if len(text) > cap:
+        text = text[:cap]
+    return truncate(re.sub(r"\s+", " ", text), limit)
+
+
+def yaml_str(value: object) -> str:
+    """A safely quoted YAML scalar for the digest frontmatter.
+
+    Every value in that block comes from outside: a directory name, a git
+    branch, the hook payload's end reason. All of them may legally contain a
+    double quote, and interpolating one raw broke the *whole* block — a
+    checkout at `~/src/my"repo` rendered `repo: "my"repo"`, after which
+    Obsidian and journal_util's own frontmatter() both misread status and
+    session_id, i.e. dedupe and `pending` silently stopped working for that
+    session. Control characters are flattened for the same reason: one stray
+    newline ends the scalar and turns the rest into bogus keys.
+    """
+    text = "" if value is None else str(value)
+    text = re.sub(r"[\x00-\x1f\x7f]+", " ", text)
+    return '"' + text.replace("\\", "\\\\").replace('"', '\\"') + '"'
 
 
 def redact(text: str, enabled: bool = True) -> str:
@@ -250,10 +334,35 @@ def redact(text: str, enabled: bool = True) -> str:
         run = text[kw.end() : run_end]
         if run and run != "s" and text[ident_start:ident_end].lower() != "authorization":
             continue
+        # The keyword also has to name the key being assigned — not a namespace
+        # component and not a type inside a qualified name. The vault's
+        #   com.digitalasset.auth.TokenService: <error text>
+        # matched twice and ate a word of the error message both times: once on
+        # `auth`, whose bridge to the separator crosses a dot, and once on
+        # `Token`, the head of a class name four segments deep. Two narrow
+        # rejections, neither of which touches a real key:
+        #
+        #   1. Deep in a dotted path (2+ segments), a keyword that is only
+        #      *part* of its segment is the head of a compound type name —
+        #      `TokenService`, `AuthManager` — not a key. When the keyword is
+        #      the whole segment it still is the key, so
+        #      `vault.secrets.token = x` masks; so does `config.api_key = x`,
+        #      one segment deep either way.
+        #   2. A bridge that crosses a dot means the key is a later segment, so
+        #      this keyword is only its namespace. Same reasoning: if the real
+        #      key is secret-ish, its own match handles it.
+        #
+        # `AWS_SECRET_ACCESS_KEY=`, `{"secretValue": x}` and `api_key: x` are
+        # unaffected — nothing there is dotted.
+        whole_segment = kw.start() == ident_start and kw.end() == ident_end
+        if not whole_segment and _qualified_depth(text, ident_start) >= 2:
+            continue
         tail = ASSIGN_TAIL_RE.match(text, kw.end())
         if not tail:
             continue
         start, end = tail.start(1), tail.end(1)
+        if "." in text[kw.end() : start]:
+            continue
         if start < pos:
             continue
         out.append(text[pos:start])
@@ -275,6 +384,27 @@ def redact(text: str, enabled: bool = True) -> str:
     text = USER_PW_RE.sub(lambda m: f"{m.group(1)}{m.group(2)}{m.group(3)}:«redacted»", text)
     text = URL_CRED_RE.sub(lambda m: m.group(1) + ":«redacted»@", text)
     return BLOB_RE.sub("«redacted»", text)
+
+
+def _qualified_depth(text: str, ident_start: int) -> int:
+    """How many `<ident>.` segments immediately precede this identifier.
+
+    `com.digitalasset.auth.TokenService` -> 3 for the `TokenService` segment,
+    `config.api_key` -> 1, `"api_key"` -> 0. Used to tell a fully-qualified
+    class or module name (Java/Scala/Python import paths, log prefixes) from an
+    attribute assignment, which in practice has at most one dot.
+    """
+    depth = 0
+    i = ident_start
+    while i > 0 and text[i - 1] == ".":
+        j = i - 1
+        while j > 0 and (text[j - 1].isalnum() or text[j - 1] in "_"):
+            j -= 1
+        if j == i - 1:  # a dot with no identifier before it
+            break
+        depth += 1
+        i = j
+    return depth
 
 
 ANSWER_PAIR_RE = re.compile(r'"[^"]*"\s*=\s*"([^"]*)"')
@@ -356,6 +486,49 @@ def stringify(value: object, limit: int = 400) -> str:
                 return stringify(value[key], limit)
         return one_line(json.dumps(value, ensure_ascii=False), limit)
     return one_line(str(value), limit)
+
+
+def scan_text(value: object, head: int = 6000, tail: int = 6000) -> str:
+    """Head *and* tail of a tool result, for sniffing shell failures.
+
+    stringify() keeps the first N characters, which is right for quoting but
+    wrong for detection: a shell failure signs itself at the *end* — the pytest
+    summary line, the last frame of a traceback, tsc's error count. A 37KB test
+    log whose last line was "3 failed, 1197 passed" therefore scanned clean and
+    the digest claimed `errors_hit: 0`, which is precisely the blind spot
+    SHELL_FAILURE_RE exists to close.
+
+    Both ends are collapsed to one line so the (anchor-free) failure patterns
+    match the same way they do on stringify() output.
+
+    `head` matches the 6000 the old scanner used, so this is strictly a
+    widening. Shrinking it to make room for the tail is not free: on the local
+    corpus a head of 3000 *lost* a failure that sat at character ~4000 of a
+    medium-length result, trading one blind spot for another.
+    """
+    if isinstance(value, str):
+        text = value
+    elif isinstance(value, list):
+        parts = []
+        for item in value:
+            if isinstance(item, dict) and item.get("type") == "text":
+                parts.append(str(item.get("text") or ""))
+            else:
+                parts.append(str(item))
+        text = "\n".join(parts)
+    elif isinstance(value, dict):
+        for key in ("text", "content", "stdout", "stderr", "error", "message", "result"):
+            if value.get(key):
+                return scan_text(value[key], head, tail)
+        text = json.dumps(value, ensure_ascii=False)
+    elif value is None:
+        return ""
+    else:
+        text = str(value)
+    if len(text) <= head + tail:
+        return one_line(text, head + tail)
+    # The separator keeps a pattern from matching across the seam.
+    return one_line(text[:head], head) + " … " + one_line(text[-tail:], tail)
 
 
 def is_error_result(block: dict, entry: dict) -> bool:
@@ -760,7 +933,7 @@ def _consume_entry(
             detail = ""
             inferred = False
             if not failed and name == "Bash" and facts["inferred_errors"] < cfg["max_errors"]:
-                body = stringify(block.get("content"), 6000)
+                body = scan_text(block.get("content"))
                 hit = SHELL_FAILURE_RE.search(body)
                 if hit:
                     failed = inferred = True
@@ -918,6 +1091,18 @@ def fit_sections(head: list[str], sections: list[dict], budget: int) -> list[str
     return head + [ln for s in sections for ln in render_section(s)]
 
 
+def callout(kind: str, title: str, body: str) -> list[str]:
+    """An Obsidian callout block.
+
+    A plain `> ⚠️ ...` quote is legible but inert; `> [!warning]` renders as a
+    collapsible, colour-coded admonition and is skimmable in a folder of
+    hundreds of digests. Outside Obsidian it still degrades to an ordinary
+    blockquote, so nothing is lost when the file is read in a plain editor.
+    Body text is one paragraph — every continuation line needs its own `>`.
+    """
+    return [f"> [!{kind}] {title}", "> " + re.sub(r"\s+", " ", body).strip(), ""]
+
+
 def build_digest(facts: dict, meta: dict, cfg: dict) -> str:
     cwd = meta["cwd"]
     ident = meta.get("ident") or repo_identity(cwd)
@@ -973,24 +1158,26 @@ def build_digest(facts: dict, meta: dict, cfg: dict) -> str:
     add("---")
     add('type: dev-journal-raw')
     add("status: unprocessed")
-    add(f'session_id: "{meta["session_id"]}"')
+    # Every quoted value goes through yaml_str(): repo/branch/cwd/end_reason all
+    # come from outside and a bare `"` in any of them corrupts the whole block.
+    add("session_id: " + yaml_str(meta["session_id"]))
     part = int(meta.get("part") or 0)
     if part:
         add(f"part: {part}")
-    add(f'repo: "{repo}"')
-    add(f'worktree: "{worktree}"')
+    add("repo: " + yaml_str(repo))
+    add("worktree: " + yaml_str(worktree))
     add(f'repo_name_guessed: {"true" if ident["guessed"] else "false"}')
-    add(f'branch: "{branch}"')
-    add(f'cwd: "{cwd}"')
-    add(f'host: "{redact(host_name(cfg), cfg["redact"])}"')
-    add(f'started: "{started}"')
-    add(f'ended: "{(facts["last_ts"] or "")[:19]}"')
-    add(f'duration: "{duration}"')
-    add(f'end_reason: "{meta.get("reason", "")}"')
+    add("branch: " + yaml_str(branch))
+    add("cwd: " + yaml_str(cwd))
+    add("host: " + yaml_str(redact(host_name(cfg), cfg["redact"])))
+    add("started: " + yaml_str(started))
+    add("ended: " + yaml_str((facts["last_ts"] or "")[:19]))
+    add("duration: " + yaml_str(duration))
+    add("end_reason: " + yaml_str(meta.get("reason", "")))
     add(f"turns: {facts['assistant_turns']}")
     add(f"files_touched: {len(facts['files'])}")
     add(f"errors_hit: {len(facts['errors'])}")
-    add(f'models: "{", ".join(sorted(facts["models"]))}"')
+    add("models: " + yaml_str(", ".join(sorted(facts["models"]))))
     add("---")
     add("")
     heading = f"# Raw session digest — {repo}"
@@ -999,44 +1186,61 @@ def build_digest(facts: dict, meta: dict, cfg: dict) -> str:
     add(f"{heading} — {started[:10]}")
     add("")
     if worktree:
-        add(
-            f"> Ran in git worktree `{worktree}` of **{repo}**. "
-            f"Knowledge belongs to `{repo}`, not to the worktree."
+        out.extend(
+            callout(
+                "info",
+                f"worktree `{worktree}`",
+                f"Ran in git worktree `{worktree}` of **{repo}**. "
+                f"Knowledge belongs to `{repo}`, not to the worktree.",
+            )
         )
-        add("")
     if part:
-        add(
-            f"> ⚠️ Part {part} of this session. An earlier digest was already synthesised "
-            "while the session was still running, so this file re-reads the **whole** "
-            "transcript — it overlaps the earlier note. Journal only what is new, and "
-            "link the existing session note rather than writing a second one."
+        out.extend(
+            callout(
+                "warning",
+                f"Part {part} of this session",
+                "An earlier digest was already synthesised while the session was still "
+                "running, so this file re-reads the **whole** transcript — it overlaps "
+                "the earlier note. Journal only what is new, and link the existing "
+                "session note rather than writing a second one.",
+            )
         )
-        add("")
     if ident["guessed"]:
-        add(
-            f"> ⚠️ `repo: {repo}` is inferred from the directory name because "
-            f"{ident.get('reason') or 'the repo could not be resolved'} (`{cwd}`). "
-            "It may be a worktree's name, or a parent folder that merely contains "
-            "repos. Verify before filing this under a project note."
+        out.extend(
+            callout(
+                "warning",
+                "repo name is a guess",
+                f"`repo: {repo}` is inferred from the directory name because "
+                f"{ident.get('reason') or 'the repo could not be resolved'} (`{cwd}`). "
+                "It may be a worktree's name, or a parent folder that merely contains "
+                "repos. Verify before filing this under a project note.",
+            )
         )
-        add("")
-    add(
-        "> Machine-extracted facts, no interpretation. "
-        "Synthesised by the `dev-journal` skill; do not hand-edit."
+    out.extend(
+        callout(
+            "abstract",
+            "raw capture",
+            "Machine-extracted facts, no interpretation. "
+            "Synthesised by the `dev-journal` skill; do not hand-edit.",
+        )
     )
-    add("")
 
     lines_read = facts.get("lines_read", 0)
     if facts.get("parse_errors") and lines_read and facts["parse_errors"] > lines_read * 0.1:
-        add(
-            f"> ⚠️ {facts['parse_errors']}/{lines_read} transcript lines were unparseable — "
-            "the Claude Code transcript format may have changed. "
-            "Run `dev-journal-setup` diagnostics."
+        out.extend(
+            callout(
+                "warning",
+                "transcript may have drifted",
+                f"{facts['parse_errors']}/{lines_read} transcript lines were unparseable — "
+                "the Claude Code transcript format may have changed. "
+                "Run `dev-journal-setup` diagnostics.",
+            )
         )
-        add("")
     if facts["assistant_turns"] == 0 and not facts["prompts"]:
-        add("> ⚠️ Nothing recognisable was extracted from this transcript.")
-        add("")
+        out.extend(
+            callout("warning", "empty capture",
+                    "Nothing recognisable was extracted from this transcript.")
+        )
 
     sections: list[dict] = []
 
@@ -1183,12 +1387,33 @@ def build_digest(facts: dict, meta: dict, cfg: dict) -> str:
 # main
 # --------------------------------------------------------------------------- #
 def resolve_output_dir(cfg: dict) -> tuple[Path, bool]:
+    """Where this digest goes, having proved we can actually write there.
+
+    "The vault directory exists" is not the same as "the vault is usable": an
+    unmounted external drive leaves the mount point behind, a sync client can
+    hold the folder read-only mid-sync, and a vault on a network share simply
+    disappears. All of those used to surface as an OSError inside main(), which
+    the top-level guard logged and swallowed — the session was gone, and the
+    only trace was one line in capture.log nobody reads.
+
+    Staging keeps the digest; `journal_util.py init` migrates staged files back
+    into the vault, and `pending` reads both locations meanwhile.
+    """
     vault = (cfg.get("vault_path") or "").strip()
     if vault:
         vault_path = Path(os.path.expanduser(vault))
         if vault_path.is_dir():
-            return vault_path / cfg["base_folder"] / "_raw", True
-        log(f"vault_path '{vault}' is not a directory; staging locally")
+            target = vault_path / cfg["base_folder"] / "_raw"
+            try:
+                target.mkdir(parents=True, exist_ok=True)
+                probe = target / f".write-probe.{os.getpid()}"
+                probe.write_text("", encoding="utf-8")
+                probe.unlink()
+                return target, True
+            except OSError as exc:
+                log(f"vault digest folder is not writable ({exc}); staging locally")
+        else:
+            log(f"vault_path '{vault}' is not a directory; staging locally")
     return STATE_DIR / "staged", False
 
 
@@ -1229,10 +1454,10 @@ def main() -> int:
         log(f"no transcript at '{transcript}'; nothing to do")
         return 0
 
-    for excluded in cfg.get("exclude_paths") or []:
-        if excluded and excluded in cwd:
-            log(f"cwd matches exclude_paths entry '{excluded}'; skipping")
-            return 0
+    excluded = excluded_matches(cfg, cwd)
+    if excluded:
+        log(f"cwd matches exclude_paths entry '{excluded}'; skipping")
+        return 0
 
     facts = parse_transcript(Path(transcript), cfg)
 
@@ -1268,10 +1493,10 @@ def main() -> int:
     # Privacy gate must be re-run against the resolved cwd: the earlier check
     # only saw the payload's cwd, and a session that ran inside an excluded
     # repo but ended elsewhere would otherwise slip through.
-    for excluded in cfg.get("exclude_paths") or []:
-        if excluded and excluded in cwd:
-            log(f"resolved cwd matches exclude_paths entry '{excluded}'; skipping")
-            return 0
+    excluded = excluded_matches(cfg, cwd)
+    if excluded:
+        log(f"resolved cwd matches exclude_paths entry '{excluded}'; skipping")
+        return 0
 
     ident = refine_identity(cwd, facts["cwd_counts"])
     meta = {"cwd": cwd, "session_id": session_id, "reason": reason, "ident": ident}
@@ -1281,7 +1506,11 @@ def main() -> int:
         return 0
 
     out_dir, in_vault = resolve_output_dir(cfg)
-    out_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        out_dir.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:  # only reachable for the staging dir
+        log(f"cannot create {out_dir}: {exc}")
+        return 0
     day = (facts["first_ts"] or datetime.now(timezone.utc).isoformat())[:10]
     # Filenames group by canonical repo so worktree sessions sort next to the
     # main repo's; the worktree stays visible as a suffix.
@@ -1382,13 +1611,19 @@ def main() -> int:
         return bool(blocker()[0])
 
     tmp_file = out_file.with_name(f".{out_file.name}.{os.getpid()}.tmp")
-    tmp_file.write_text(digest, encoding="utf-8")
-    # Re-check at the last moment: a concurrent capture may have landed a richer
-    # digest while we were parsing.
-    if write_blocked():
+    try:
+        tmp_file.write_text(digest, encoding="utf-8")
+        # Re-check at the last moment: a concurrent capture may have landed a
+        # richer digest while we were parsing.
+        if write_blocked():
+            tmp_file.unlink(missing_ok=True)
+            return 0
+        os.replace(tmp_file, out_file)
+    except OSError as exc:
+        # Never leave a half-written dotfile behind in someone's synced vault.
         tmp_file.unlink(missing_ok=True)
+        log(f"could not write {out_file}: {exc}")
         return 0
-    os.replace(tmp_file, out_file)
     # This digest supersedes any thinner twin left under an older repo name.
     if not part:
         for stale in twins():

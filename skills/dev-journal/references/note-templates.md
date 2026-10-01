@@ -103,6 +103,7 @@ edit it and note the correction.
 ```markdown
 ---
 type: learning
+aliases: [Redis Lua, EVAL]     # 이 주제를 부르는 다른 이름. [[Redis Lua]] 도 이 노트로 온다
 tags: [dev-journal, learning, redis]
 first_learned: 2026-08-11
 last_updated: 2026-08-11
@@ -121,8 +122,18 @@ confidence: solid      # shaky | solid
 - **다음에**: TTL 이 필요한 카운터는 처음부터 Lua 로 쓴다.
 
 ## 관련
-[[2026-08-11-rate-limit-redis-vs-inmemory]]
+- [[Redis 커넥션 풀 고갈]] — 같은 서브시스템, 이 노트의 원인이 저쪽에서 재발
+- [[2026-08-11-rate-limit-redis-vs-inmemory]] · [[my-api]]
 ```
+
+`## 관련` 은 세션·프로젝트만 나열하는 자리가 아니다. **다른 `Learnings/` 노트로
+2~3개 링크**하고, 저쪽 노트에도 역방향 링크를 넣는다. 이게 없으면 주제 노트가
+세션에서 들어오기만 하는 잎이 되어 서로 고립된다(실측 41%). 관계를 몇 단어로
+같이 적는다 — 같은 서브시스템 / 같은 근본 원인 / 선행 조건 / 이쪽이 저쪽을 대체.
+관계가 없으면 링크하지 않는다.
+
+어떤 노트가 있는지는 `journal_util.py topics --query <주제>` 로 본다 — 이름,
+`## 핵심` 한 줄, 태그, 이미 걸린 이웃까지 돌려주므로 41개를 다 읽지 않아도 된다.
 
 ---
 
@@ -135,6 +146,7 @@ not longer. Prune lines that are no longer true.
 ---
 type: project
 repo: my-api
+aliases: [my-api, MyAPI]       # 레포를 부르는 다른 이름. worktree 이름은 넣지 않는다
 tags: [dev-journal, project, my-api]
 last_updated: 2026-08-11
 sessions: 12
@@ -154,7 +166,13 @@ sessions: 12
 - 마이그레이션은 alembic, 수동 DDL 금지.
 
 ## 함정
-- 테스트는 `REDIS_URL` 이 없으면 조용히 통과한다 — CI 에서만 실제로 돈다.
+
+> [!warning] 조용히 실패하는 것들
+> 테스트는 `REDIS_URL` 이 없으면 조용히 통과한다 — CI 에서만 실제로 돈다.
+
+Obsidian callout(`> [!warning]`, `> [!tip]`, `> [!danger]`)은 접히고 색이 붙어서
+훑을 때 눈에 띈다. 함정·불변 규칙처럼 "나중에 놓치면 아픈 것"에만 쓴다. 남용하면
+아무것도 안 쓴 것과 같아진다.
 
 ## 자주 쓰는 명령
 - `make test-int` — 통합 테스트 (docker 필요)
@@ -168,6 +186,12 @@ sessions: 12
 ## 5. `Career/Achievements.md`
 
 Append-only. One `##` heading per month, newest month at the top.
+
+**연 단위로 갈아탄다.** append-only 는 상한이 없다 — 몇 년 쌓이면 한 파일이
+수백 KB 가 되고, `career-review` 가 매번 그걸 통째로 읽는다. 파일이 대략 100개
+불릿(≈50KB)을 넘으면 지난 해 분량을 `Career/Achievements-2025.md` 로 잘라내고
+현재 파일 상단에 `> [!info] 이전 기록 [[Achievements-2025]]` 를 남긴다.
+`career-review` 는 `Career/` 폴더 전체를 읽으므로 범위는 그대로다.
 
 ```markdown
 ---
@@ -195,41 +219,14 @@ the repo and a wikilink to its session. Keep it to one or two sentences.
 
 ---
 
-## Optional index note
+## Index note
 
-Offer to create `<vault>/DevJournal/DevJournal.md` once. Requires the Dataview
-plugin.
+Do not hand-write it — `journal_util.py index` generates
+`<vault>/DevJournal/DevJournal.md` with the Dataview queries already matching
+the frontmatter keys above, plus a plugin-free fallback section. Run it once per
+vault; `--force` rewrites it after a key or `base_folder` change.
 
-```markdown
-# Dev Journal
-
-## 최근 세션
-```dataview
-TABLE repo, duration, date
-FROM #dev-journal AND "DevJournal/Sessions"
-SORT date DESC
-LIMIT 20
-```
-
-## 결정 로그
-```dataview
-TABLE repo, status, date
-FROM #decision
-SORT date DESC
-```
-
-## 처리 대기 중인 다이제스트
-```dataview
-LIST
-FROM "DevJournal/_raw"
-WHERE status = "unprocessed"
-```
-
-## 흔들리는 지식 (복습 필요)
-```dataview
-LIST
-FROM #learning
-WHERE confidence = "shaky"
-SORT last_updated ASC
-```
-```
+The previous version of this file inlined the note as a markdown block with
+Dataview fences nested inside it, which does not render and drifted out of sync
+with the generator. If a frontmatter key changes here, change
+`INDEX_NOTE` in `scripts/journal_util.py` in the same commit.

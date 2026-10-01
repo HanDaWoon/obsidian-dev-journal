@@ -77,6 +77,14 @@ the *next* session will be the first one captured. `last_capture_log_line` shows
 whether capture has ever fired; `stale_pending_payloads` above ~5 suggests the
 background process is failing — check the capture log.
 
+`config_problems` lists config mistakes that degrade capture *silently* rather
+than failing: an `extra_commands` regex that does not compile (capture falls
+back to the built-in command list), a limit written as a string (falls back to
+the default), a malformed `exclude_paths`. Report anything listed there — the
+user has no other way to notice. `exclude_paths` in the report shows what each
+entry expands to, which is how you confirm a `~/private` entry is actually
+excluding something.
+
 Then prove the parser works against a real transcript, without touching the vault:
 
 ```bash
@@ -137,6 +145,8 @@ synthesis.
 | Sessions being skipped | Below the signal threshold — lower `min_user_prompts` in the config |
 | Digests inconsistent between sessions (some missing sections) | `doctor` → `plugin_version_mismatch`. Different runtimes can load different copies of the plugin |
 | Secrets appearing in digests | `redact` catches `key=`/`token:` patterns only. Add the repo to `exclude_paths` for anything sensitive |
+| Digests appear in `staged/` even though the vault is configured | The vault folder was not writable at capture time (unmounted drive, sync lock). `doctor` → `vault_ok`, then rerun `init` to migrate them back |
+| An excluded repo is being journalled anyway | `doctor` → `exclude_paths`, check `expands_to`. Matching is a substring of the session's cwd |
 
 ## Privacy note to surface once during setup
 

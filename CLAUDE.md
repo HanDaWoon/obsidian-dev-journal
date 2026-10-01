@@ -208,8 +208,21 @@ PreCompact 로 다이제스트가 생기고 → 사용자가 `/dev-journal` 을 
 경계를 요구한다: 없으면 `ssh-keygen` 의 `-keygen` 이 플래그로 잡혀 **다음 인자**가
 지워진다.
 
-카멜케이스(`TokenService`)는 일부러 남겨뒀다. 이걸 막으려면 `{"secretValue": …}` 도
-같이 놓치게 되는데, **마스킹 실패가 오탐보다 나쁘다.**
+카멜케이스만으로는 `{"secretValue": …}` 와 `TokenService` 를 못 가른다(구조가 같다).
+가르는 건 **점**이다 — 키워드는 **대입되는 키 자체**여야 하고, 네임스페이스 성분이나
+정규화된 이름 속의 타입이면 안 된다. 규칙 둘:
+
+- 점 경로 2단 이상 깊은 곳에서 키워드가 세그먼트의 **일부**면 복합 타입명이다
+  (`com.…auth.TokenService`, `…security.AuthManager`) → 건너뛴다. 키워드가 세그먼트
+  **전체**면 여전히 키이므로 `vault.secrets.token = x` 는 마스킹된다.
+- 키워드에서 구분자까지의 다리가 점을 넘으면 진짜 키는 뒤쪽 세그먼트다
+  (`auth.TokenService:`, `secrets.json:`) → 건너뛴다. 뒤쪽이 진짜 시크릿이면
+  그쪽 키워드 매치가 잡는다.
+
+둘 다 점이 없는 것은 건드리지 않으므로 `AWS_SECRET_ACCESS_KEY=`, `api_key: x`,
+`{"secretValue": x}`, `config.api_key = x` 는 그대로 마스킹된다. **마스킹 실패가
+오탐보다 나쁘다**는 원칙은 유지된다 — 이 규칙은 마스킹을 좁히는 게 아니라 키가
+아닌 것을 키로 오인하던 것을 고친다.
 
 ### 19. 테스트는 실제 볼트에 닿을 수 없어야 한다
 `run_capture()` 를 `home=` 없이 부른 케이스가 실제 홈 → 실제 config → 실제 볼트에
@@ -237,30 +250,122 @@ fallback 인 `"session"` 이 **모든 다이제스트의 호스트가 되어버�
 합성 노트로도 넘겨야 한다. `_raw` 는 `prune` 으로 볼트를 떠나므로(20번), 세션 노트가
 남는 유일한 기록이다.
 
+### 22. 셸 실패는 출력의 **끝**에 서명한다
+15번의 짝. 감지기는 `stringify(content, 6000)` 으로 앞 6000자만 봤는데, pytest
+요약("3 failed, 1197 passed")·traceback 마지막 프레임·tsc 에러 카운트는 전부
+**끝**에 있다. 37KB 로그를 낸 진짜 실패 세션이 `errors_hit: 0` 으로 나왔다 —
+15번이 막으려던 바로 그 사각지대다. `scan_text()` 가 앞 3000 + 뒤 3000 을 이어
+붙여 본다(사이에 ` … ` 를 넣어 이음매를 가로지르는 오탐을 막는다).
+
+`one_line()` 도 같은 자리에서 손봤다. 전체 문자열에 `re.sub(r"\s+")` 를 돌린 뒤
+잘랐기 때문에 수 MB tool_result 마다 전체를 훑었다. 공백 축약은 문자열을 **늘리지
+않으므로** 앞에서 `limit*32` 만 자르고 돌려도 결과가 같다.
+
+### 23. frontmatter 값은 반드시 `yaml_str()` 로 감싼다
+`repo`/`branch`/`cwd`/`end_reason` 은 전부 바깥에서 온다. `my"repo` 라는 체크아웃
+하나가 `repo: "my"repo"` 를 만들면 **블록 전체**가 깨지고, Obsidian 도
+`journal_util.frontmatter()` 도 `status` 와 `session_id` 를 잘못 읽는다 — 그 세션은
+dedup 도 `pending` 도 영원히 못 본다. `yaml_str()` 이 `"`/`\` 를 이스케이프하고
+제어문자를 공백으로 눕힌다(줄바꿈 하나면 스칼라가 거기서 끝난다).
+읽는 쪽 `unquote_scalar()` 와 **짝**이다. 한쪽만 고치면 어긋난다.
+
+### 24. 설정은 손으로 쓰는 JSON이다 — 강제 변환한다
+`"max_prompts": "40"` 하나로 `2 > "40"` 이 build_digest 깊은 곳에서 TypeError 를
+내고, 최상위 가드가 그걸 삼켜서 세션이 로그 한 줄과 함께 사라졌다.
+`coerce_config()` 가 숫자 키를 int 로 강제하고 하한을 걸며, `exclude_paths` 가
+리스트가 아니면 무시한다(문자열이면 한 글자씩 순회해 버린다). `doctor` 의
+`config_problems` 가 같은 것들을 사용자에게 보여준다 — **조용히 degrade 하는
+설정 오류는 진단에 나와야 한다.**
+
+### 25. `exclude_paths` 는 `~` 를 푼다
+프라이버시 스위치가 조용히 아무것도 안 하는 게 최악이다. 설정은 사람이 쓰므로
+`~/work/client-private` 라고 적는 게 자연스러운데, transcript 의 cwd 는 항상
+절대경로라 **한 번도 매칭되지 않았다.** `excluded_matches()` 가 원문과 확장형
+둘 다로 검사한다(기존 절대경로 설정은 그대로 동작). `doctor` 는 각 항목이 무엇으로
+풀리는지 같이 보여준다.
+
+### 26. 볼트가 "있다" 와 "쓸 수 있다" 는 다르다
+외장 드라이브가 빠져도 마운트 포인트는 남고, 동기화 클라이언트가 폴더를 잠글 수
+있다. 예전엔 그게 main() 안의 OSError 로 터져 최상위 가드가 삼켰고 — 세션은 그냥
+없어졌다. `resolve_output_dir()` 이 실제로 write probe 를 돌려보고, 실패하면
+staging 으로 물러난다(`init` 이 나중에 볼트로 옮긴다). tmp 파일도 실패 시 지운다 —
+동기화되는 볼트에 반쯤 쓰인 dotfile 을 남기지 않는다.
+
+### 27. `pending` 출력은 모델 컨텍스트로 직행한다
+`pending` 은 dev-journal 스킬의 **1단계**이고 JSON 이 그대로 컨텍스트에 들어간다.
+미처리 1667건이면 634KB(≈16만 토큰)라, 노트 한 장 쓰기 전에 컨텍스트가 터진다 —
+그 스킬이 존재하는 이유인 백로그에서 정확히 그렇게 된다. 기본 40건(오래된 순)만
+돌려주고 `count` 로 총계, `truncated` 로 잘림을 알린다. `--limit 0` 은 스크립팅용.
+
+디스크 쪽은 병목이 아니다. 실측(다이제스트 5000개/30MB): 캡처 0.24s,
+`pending`/`stats`/`doctor`/`prune` 각 0.3~0.4s. 커지는 건 **Obsidian** 이고,
+그게 20번(`prune`)과 인덱스 노트 쿼리의 `LIMIT` 이 있는 이유다.
+
+### 28. Obsidian 기능은 골라 쓴다
+쓰는 것과 이유:
+- **frontmatter + 태그** — 모든 쿼리의 기반. 노트는 Dataview 에 묶여 있지 않다
+  (평범한 마크다운 + YAML). 인덱스 노트만 Dataview 를 쓰고, 플러그인 없이도
+  둘러볼 수 있는 태그/폴더 섹션을 같이 넣는다. Dataview 는 릴리스가 뜸하고
+  후속작(Datacore)과 코어의 Bases 가 있으므로, **의존을 인덱스 노트 한 장에
+  가둬 두는 것**이 대비다.
+- **aliases** — `Projects/`·`Learnings/` 에. 같은 레포/주제를 다른 이름으로
+  부르면 노트가 둘로 갈라진다.
+- **callout** — 다이제스트의 경고와 `Projects/` 의 함정에만. 남용하면 아무 데도
+  안 쓴 것과 같아진다. Obsidian 밖에서는 평범한 인용문으로 degrade 한다.
+- **`- [ ]` 체크박스** — 인덱스 노트가 Dataview `TASK` 로 모든 세션의 미완료
+  항목을 한 곳에 모은다. 평범한 불릿으로 쓴 「남은 일」은 거기 안 나온다.
+
+안 쓰는 것: Canvas, 데일리 노트 연동, `cssclasses`. 쓸 자리가 없거나 볼트 설정을
+침범한다.
+
+### 29. Learnings 는 서로 링크해야 그래프가 된다
+실측(볼트 노트 170개, 링크 510개, 고아 0.6%): 링크 위생 자체는 좋았다. 문제는
+**주제 노트끼리**였다 — Learnings 41개 사이의 링크가 22개뿐이라 17개(41%)가 주제
+그래프에서 고립돼 있었고, 정작 제목에는 `Canton …` 5개처럼 명백한 클러스터가
+보였다. 세션→학습 링크만 있으면 Learnings 는 잎으로 남는다.
+
+Sessions 는 로그다. 1년 뒤에도 열어보는 건 Learnings 그래프고, 그 그래프는 이
+링크가 써져야 존재한다. 그래서 합성 규칙에 **"주제 노트를 만들거나 덧붙일 때
+다른 Learnings 2~3개에 양방향 링크"** 를 넣었다. 관계(같은 서브시스템 / 같은 근본
+원인 / 선행 조건 / 대체)를 몇 단어로 같이 적게 한 것은, 개수 채우기용 링크가
+그래프를 다시 무의미하게 만들기 때문이다.
+
+이걸 잘 하려면 기존 노트가 **무슨 내용인지** 알아야 하는데 링크 하나 걸자고 41개를
+읽을 수는 없다. `journal_util.py topics` 가 이름 + `## 핵심` 한 줄 + 태그 + 이미
+걸린 이웃을 한 번에 돌려준다(`--query` 로 좁힌다. 전체는 ~5.8k 토큰).
+`isolated` 가 아직 아무도 닿지 않는 주제를 세어주고, 인덱스 노트에도 같은 목록이
+Dataview 로 들어가 있다.
+
+백링크와 그래프 뷰는 **붙이는 기능이 아니다** — `[[링크]]` 의 자동 부산물이다.
+허브 구조는 이미 의도대로다(백링크 상위: Projects·Learnings, 잎: Sessions).
+다이제스트를 위키링크로 참조하지 않는 것도 의도적이다 — `prune`(20번) 이 볼트
+밖으로 옮기는 순간 전부 깨진 링크가 된다. 평문 경로로 남긴다.
+
 ## 파일 지도
 
 | 파일 | 역할 |
 | --- | --- |
 | `scripts/on_session_end.sh` | 훅 진입점. 즉시 반환 + 로그 회전 + 고아 페이로드 청소 |
 | `scripts/capture_session.py` | transcript → 다이제스트. LLM 미사용. 성능 민감 |
-| `scripts/journal_util.py` | CLI: init/doctor/pending/cat/done/hold/unhold/index/prune/backfill/stats |
+| `scripts/journal_util.py` | CLI: init/doctor/pending/cat/done/hold/unhold/index/prune/backfill/topics/stats |
 | `skills/dev-journal/` | 합성 스킬 + `references/note-templates.md` |
 | `skills/dev-journal-setup/` | 볼트 연결, 진단, backfill 안내 |
 | `skills/career-review/` | 이력서 불릿·성과 리뷰·성장 회고 |
 | `hooks/hooks.json` | SessionEnd + PreCompact. `${CLAUDE_PLUGIN_ROOT}` 사용 |
-| `tests/test_capture.py` | 회귀 스위트 202건. 의존성 없음 |
+| `tests/test_capture.py` | 회귀 스위트 259건. 의존성 없음 |
 
 상태는 전부 홈 디렉터리에 있다: `~/.claude/obsidian-dev-journal/`(config.json,
 logs/, pending/, staged/). 리포에는 코드만 들어간다.
 
 ## 작업 규칙
 
-- **수정 후 반드시** `python3 tests/test_capture.py` — 202건 전부 통과해야 한다.
+- **수정 후 반드시** `python3 tests/test_capture.py` — 259건 전부 통과해야 한다.
   테스트 케이스마다 어떤 버그를 붙잡고 있는지 주석이 있다. 근거를 모르고 삭제하지
   말 것.
 - 훅/스킬 파일을 고치면 Claude Code에서 `/plugin update` 또는 `/reload-plugins`
   후 재시작해야 반영된다(SKILL.md 본문은 즉시 반영).
 - 스킬 SKILL.md는 3000단어 미만으로 유지한다. 상세 내용은 `references/`로 뺀다.
+- 다이제스트 frontmatter 에 새 키를 추가할 때는 `yaml_str()` 로 감싼다(23번).
 - 다이제스트에 새 정보를 추가할 때는 반드시 `redact()`를 통과시킨다. 프롬프트,
   명령어, AskUserQuestion 답변, 서브에이전트 설명, 검색 쿼리가 이미 그렇게 되어
   있다 — 새 필드를 추가하면서 빠뜨린 적이 있다.
