@@ -48,7 +48,7 @@ Sessions · Decisions · Learnings · Projects · Career 노트
 이 리포 자체가 플러그인 마켓플레이스다. Claude Code에서:
 
 ```
-/plugin marketplace add <github-user>/obsidian-dev-journal
+/plugin marketplace add HanDaWoon/obsidian-dev-journal
 /plugin install obsidian-dev-journal@dev-journal
 ```
 
